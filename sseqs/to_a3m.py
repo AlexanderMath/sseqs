@@ -1,4 +1,3 @@
-import os
 from sseqs.sw import sw_affine_backtrack
 
 def to_a3m(query: str, seqs: list[str], filename: str, names=None):
