@@ -1,7 +1,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
-#include <cstdio>        // ← for fprintf
+#include <cstdio>    
 
 // @alex: may be faster moving into fft kernel, would skip a VRAM<->registers copy.
 // nvprof says it gets 300GB/s vs 24GB/s RAM->VRAM so 0.16s vs 3.6s negligable. 
