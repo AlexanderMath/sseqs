@@ -1,4 +1,4 @@
-<img src='images/img.png'/>
+<img src='images/goal.png'/>
 MSA by ML researchers for ML researchers --️ in pytorch/cuda ❤️
 
 ```
