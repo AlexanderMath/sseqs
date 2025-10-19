@@ -51,10 +51,11 @@ def msa(queries,
         save_raw='', 
         verbose=True, 
         bs=50_000_000, 
-        fft_rank=4,      # the rank of the SVD(BLOSUM62_SCORE) approximation
+        fft_rank=2,      # the rank of the SVD(BLOSUM62_SCORE) approximation
         top_fft=200,     # pass on 1/top_fft from fft filter 
         top_sw=10,       # pass on 1/top_sw from sw filter 
         top_sw_affine=2, # pass on 1/top_sw_affine from sw_filter (used to be savetopk)
+        return_timings=False,
         sync_time=False): 
 
     if type(queries) == str: queries = [queries]
@@ -388,11 +389,12 @@ def msa(queries,
 
         t_a3m = time.time()-t0
 
-    return {'t_dec': t_dec, 't_prep1': t_prep1, 't_prep2': t_prep2, 
-            't_fft': t_fft, 't_prep_fft': t_prep_fft, 't_sw': t_sw, 't_out': t_out, 't_out_cpu': t_out_cpu,
-            't_log': t_log, 't_topk1': t_topk1, 
-            't_topk2': t_topk2, 't_save': t_save,
-            't_prep_sw': t_prep_sw, 't_a3m': t_a3m, 't_to_vram': t_to_vram}
+    if return_timings:
+        return {'t_dec': t_dec, 't_prep1': t_prep1, 't_prep2': t_prep2, 
+                't_fft': t_fft, 't_prep_fft': t_prep_fft, 't_sw': t_sw, 't_out': t_out, 't_out_cpu': t_out_cpu,
+                't_log': t_log, 't_topk1': t_topk1, 
+                't_topk2': t_topk2, 't_save': t_save,
+                't_prep_sw': t_prep_sw, 't_a3m': t_a3m, 't_to_vram': t_to_vram}
 
 if __name__ == "__main__":
     msa('ADAM'*30, "adam.a3m")

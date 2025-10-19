@@ -1,0 +1,36 @@
+[build-system]
+requires = [
+  "setuptools>=69",
+  "wheel"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sseqs"
+version = "0.0.1"
+description = "Simple MSA"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [ { name = "Alexander Mathiasen" } ]
+keywords = ["sseqs"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+dependencies = ["icecream", "torch", "numpy", "tqdm", "pqdm", "matplotlib", "ninja", "biotite", "pandas", "ipywidgets", "natsort", "dill"]
+
+[tool.setuptools]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sseqs*"]
+exclude = [
+  "sseqs/tests*",
+  "sseqs/tmp*",
+  "sseqs/requests*",
+  "sseqs/cache_msa*",
+]
+
+
