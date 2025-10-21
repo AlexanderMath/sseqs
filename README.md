@@ -6,11 +6,12 @@ MSA by ML researchers for ML researchers --️ in pytorch/cuda ❤️
 pip install sseqs
 wget https://foldify.org/uniref_bfd_mgy_cf.xbit 
 
-# load in python
+# python 
 from sseqs import msa
-msa("HPETLVKVKDAEDQLGARVGYIELDLNSGKILE", "msa.a3m")
+msa("HPETLVKVKDAEDQLGARVG"*10, "msa.a3m")
+db_len=998 q_len=200: 100%|█| 121/121 [00:11<00:00, 10.40GB/s]
 
-# start msa-server supporting boltz2 🔥
+# boltz2 msa-server 🔥
 DBPATH=uniref_bfd_mgy_cf.xbit python server.py --port 8000
 boltz predict demo.fasta --msa_server_url http://0.0.0.0:8000 --use_msa_server
 ```
