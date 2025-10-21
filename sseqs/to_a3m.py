@@ -42,12 +42,20 @@ def to_a3m(query: str, seqs: list[str], filename: str, names=None):
     #with open(filename, "a") as f:
     a3m = ""
     a3m += f">original_query\n{query}\n"
+    seen = {}
     for i, ares in enumerate(aligned):
         if ares["score"] == 0 or not ares["q_aligned"]: continue # skip 
 
         row = _build_target_row(ares)
         if "@" in row: continue 
-        
+
+        # problem:  .a3m has multiple identical rows
+        # cause:    different proteins have the best alignment match 
+        # solution: only add we didn't prev see 
+        # @alex:    in some cases there'll be multiple identical loss alignments, so
+        #           could give structure model more info given another one (or maybe 1% lower loss alignment)
+        if row in seen: continue 
+        seen[row] = 1
         if names is None: a3m += f">target_{i} score={ares['score']}\n"
         else: a3m += f"{names[i]}\n"
         a3m += row + "\n"

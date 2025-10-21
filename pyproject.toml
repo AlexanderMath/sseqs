@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sseqs"
-version = "0.0.1"
+version = "0.0.6"
 description = "Simple MSA"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -19,18 +19,14 @@ classifiers = [
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
 ]
-dependencies = ["icecream", "torch", "numpy", "tqdm", "pqdm", "matplotlib", "ninja", "biotite", "pandas", "ipywidgets", "natsort", "dill"]
+dependencies = ["icecream", "torch", "numpy", "tqdm", "pqdm", "matplotlib", "ninja", "pandas", 
+                 "ipywidgets", "natsort", "dill", "uvicorn", "python-multipart"]
 
 [tool.setuptools]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["sseqs*"]
-exclude = [
-  "sseqs/tests*",
-  "sseqs/tmp*",
-  "sseqs/requests*",
-  "sseqs/cache_msa*",
-]
 
-
+[tool.setuptools.package-data]
+"sseqs" = ["**/*.cu", "**/*.cpp"]

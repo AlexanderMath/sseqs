@@ -33,13 +33,25 @@ if sys.argv[-1] != '-loaded':
     conv = load("conv", sources=[f"{package_dir}/filter_bind.cpp", f"{package_dir}/filter.cu"], extra_cuda_cflags=["-O3", "--use_fast_math"], extra_cflags=["-O3"], verbose=verbose)
     sw   = load("sw",   sources=[f"{package_dir}/sw_bind.cpp",     f"{package_dir}/sw.cu"],     extra_cuda_cflags=["-O3", "--use_fast_math"], extra_cflags=["-O3"], verbose=verbose)
 
+    # Read antibody dataset. 
+    uniref_bfd_chunks = chunks 
+    AB = os.environ.get('AB', False)
+    if AB: chunks += 23 
+
     # Prepare pinned RAM to enable fast RAM->VRAM transfer.             ~ 1 GB/s
     pinned_ram = [th.empty((1_000_000_000), dtype=th.uint8, pin_memory=True) for _ in tqdm(range(chunks), desc="Initializing pinned RAM")]
 
     with open(xbit_path, "rb") as fh:
-        for i, t in enumerate(tqdm(pinned_ram, desc=f"Reading {chunks}GB from `uniref30_2302_bfd_mgy_colabfold.xbit` to pinned RAM")):
+        for i, t in enumerate(tqdm(pinned_ram[:uniref_bfd_chunks], desc=f"Reading {chunks}GB from `uniref30_2302_bfd_mgy_colabfold.xbit` to pinned RAM")):
             fh.seek(i * 1000 * 1000 * 1000)
             fh.readinto(t.numpy())
+
+    # Read antibody dataset. 
+    if AB:
+        with open(AB, "rb") as fh:
+            for i, t in enumerate(tqdm(pinned_ram[-23:], desc=f"Reading {chunks}GB from `antibody.xbit` to pinned RAM")):
+                fh.seek(i * 1000 * 1000 * 1000)
+                fh.readinto(t.numpy())
 
     sys.argv.append('-loaded')
 
@@ -51,7 +63,7 @@ def msa(queries,
         save_raw='', 
         verbose=True, 
         bs=50_000_000, 
-        fft_rank=2,      # the rank of the SVD(BLOSUM62_SCORE) approximation
+        fft_rank=4,      # the rank of the SVD(BLOSUM62_SCORE) approximation
         top_fft=200,     # pass on 1/top_fft from fft filter 
         top_sw=10,       # pass on 1/top_sw from sw filter 
         top_sw_affine=2, # pass on 1/top_sw_affine from sw_filter (used to be savetopk)
