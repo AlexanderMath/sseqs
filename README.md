@@ -9,7 +9,7 @@ wget https://foldify.org/uniref_bfd_mgy_cf.xbit
 # python 
 from sseqs import msa
 msa("HPETLVKVKDAEDQLGARVG"*10, "msa.a3m")
-db_len=998 q_len=200: 100%|█| 121/121 [00:11<00:00, 10.40GB/s]
+db_len=998 q_len=200: 100%|█████████| 121/121 [00:11<00:00, 10.40GB/s]
 
 # boltz2 msa-server 🔥
 DBPATH=uniref_bfd_mgy_cf.xbit python server.py --port 8000
