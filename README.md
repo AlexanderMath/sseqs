@@ -8,7 +8,7 @@ wget https://foldify.org/uniref_bfd_mgy_cf.xbit
 
 ```
 from sseqs import msa
-msa("HPETLVKVKDAEDQLGARVGYIELDLNSGKILE...", "msa.a3m")
+msa("HPETLVKVKDAEDQLGARVGYIELDLNSGKILE", "msa.a3m")
 ```
 
 No need for <a href="https://instances.vantage.sh/aws/ec2/x2gd.16xlarge?currency=USD">$5h/h</a> server with 1000GB RAM. 
