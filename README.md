@@ -23,6 +23,5 @@ Developed for <a href="https://cloud.vast.ai/">$0.3/h</a> rtx4090+128GB RAM.
 - no protein pairing 
 - sequence length < 1000 (working on 2048)
 - 128gb RAM (working on 64GB w/ compression) 
-- server.py supporting Boltz2 MSA-server (adding soon)
 - no <16GB approximate version (yet)
 - no evals (working on runs'n'poses + antibody)
