@@ -1,11 +1,21 @@
 from sseqs.sw import sw_affine_backtrack
+from tqdm import tqdm 
+import numpy as np 
 
-def to_a3m(query: str, seqs: list[str], filename: str, names=None):
+def to_a3m(query: str, seqs: list[str], filename: str, gap_open: int = 11, gap_extend: int = 1):
     """
     Write an A3M-formatted alignment where each target row is padded with
     leading/trailing gaps so that it covers the full query length.
     """
-    aligned = sw_affine_backtrack(query, seqs, gap_open=11, gap_extend=1)[-1]
+    batch_size = 1024
+    aligned = []
+    for start in tqdm(range(0, len(seqs), batch_size)):
+        stop = start + batch_size
+        aligned = aligned + sw_affine_backtrack(query, seqs[start: stop], gap_open=gap_open, gap_extend=gap_extend)[-1]
+    # merge into one list, then sort by score
+    scores = [a['score'] for a in aligned]
+    aligned = [aligned[i] for i in np.argsort(scores)[::-1]]
+
 
     # -------------------------------------------------------------------------
     # helper that converts ONE local alignment into a full-length A3M row
@@ -50,14 +60,13 @@ def to_a3m(query: str, seqs: list[str], filename: str, names=None):
         if "@" in row: continue 
 
         # problem:  .a3m has multiple identical rows
-        # cause:    different proteins have the best alignment match 
+        # cause:    different proteins have the same best alignment match 
         # solution: only add we didn't prev see 
         # @alex:    in some cases there'll be multiple identical loss alignments, so
         #           could give structure model more info given another one (or maybe 1% lower loss alignment)
         if row in seen: continue 
         seen[row] = 1
-        if names is None: a3m += f">target_{i} score={ares['score']}\n"
-        else: a3m += f"{names[i]}\n"
+        a3m += f">target_{i} score={ares['score']}\n"
         a3m += row + "\n"
 
     open(filename, "w").write(a3m)

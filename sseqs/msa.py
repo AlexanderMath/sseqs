@@ -7,6 +7,7 @@ import math
 from torch.utils.cpp_extension import load
 import torch as th
 from tqdm import tqdm
+import psutil
 import time 
 
 # Loads `CHUNKS` GB of MSA database to RAM. 
@@ -38,11 +39,18 @@ if sys.argv[-1] != '-loaded':
     AB = os.environ.get('AB', False)
     if AB: chunks += 23 
 
+    avail_gb_ram = psutil.virtual_memory().available / 1_000_000_000
+    needed_gb_ram = (chunks+5)
+    if avail_gb_ram <  needed_gb_ram: 
+        print(f"Need {needed_gb_ram}GB RAM, only {avail_gb_ram}GB available. ")
+        print(f"You can run with e.g. 7GB data using `CHUNKS=7 python server.py`. ") 
+        exit()
+
     # Prepare pinned RAM to enable fast RAM->VRAM transfer.             ~ 1 GB/s
-    pinned_ram = [th.empty((1_000_000_000), dtype=th.uint8, pin_memory=True) for _ in tqdm(range(chunks), desc="Initializing pinned RAM")]
+    pinned_ram = [th.empty((1_000_000_000), dtype=th.uint8, pin_memory=True) for _ in tqdm(range(chunks), desc=f"Preparing {chunks}GB of pinned RAM. ")]
 
     with open(xbit_path, "rb") as fh:
-        for i, t in enumerate(tqdm(pinned_ram[:uniref_bfd_chunks], desc=f"Reading {chunks}GB from `uniref30_2302_bfd_mgy_colabfold.xbit` to pinned RAM")):
+        for i, t in enumerate(tqdm(pinned_ram[:uniref_bfd_chunks], desc=f"Reading {chunks}GB MSA data from `{xbit_path}` into pinned RAM. ")):
             fh.seek(i * 1000 * 1000 * 1000)
             fh.readinto(t.numpy())
 
@@ -68,7 +76,7 @@ def msa(queries,
         top_sw=10,       # pass on 1/top_sw from sw filter 
         top_sw_affine=2, # pass on 1/top_sw_affine from sw_filter (used to be savetopk)
         return_timings=False,
-        sync_time=False): 
+        sync_time=False, dlength=1e6, gpu: int = 0): 
 
     if type(queries) == str: queries = [queries]
     if type(filenames) == str: filenames = [filenames]
@@ -144,8 +152,8 @@ def msa(queries,
     """
 
     # need seperate streams to overlap copying and processing
-    copy_stream = th.cuda.Stream(0)   # create once at start
-    compute_stream = th.cuda.Stream(0)   # create once at start
+    copy_stream = th.cuda.Stream(gpu)   # create once at start
+    compute_stream = th.cuda.Stream(gpu)   # create once at start
 
     MAX_GOOD_INDXs = 500
     preallocated_arange = th.arange(int(MAX_GOOD_INDXs), device='cuda', dtype=th.int32)
@@ -213,6 +221,10 @@ def msa(queries,
                     last_is_delimiter = ascii[-1] == 64
                     if last_is_delimiter:  lengths[-1] -= 1
                     max_seq_length = float(lengths.float().max().item())
+
+                    # assuming https://x.com/saakohl/status/1980206575802269821
+                    # => accuracy comes from seqs of similar length -- appears to hold empirically.
+                    if abs(len(query) - max_seq_length) > dlength: continue 
                     lengths = lengths[lengths!=0] 
                     num_seqs += lengths.shape[0]
                     if sync_time: th.cuda.synchronize()
