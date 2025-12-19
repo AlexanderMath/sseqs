@@ -2,16 +2,18 @@ from sseqs.sw import sw_affine_backtrack
 from tqdm import tqdm 
 import numpy as np 
 
-def to_a3m(query: str, seqs: list[str], filename: str, gap_open: int = 11, gap_extend: int = 1):
+def to_a3m(query: str, seqs: list[str], filename: str, gap_open: int = 11, gap_extend: int = 1, batch_size: int = 1024):
+    # todo: try with gap_open=10 ?
     """
     Write an A3M-formatted alignment where each target row is padded with
     leading/trailing gaps so that it covers the full query length.
     """
-    batch_size = 1024
     aligned = []
-    for start in tqdm(range(0, len(seqs), batch_size)):
+    pbar = tqdm(range(0, len(seqs), batch_size))
+    for start in pbar:
         stop = start + batch_size
         aligned = aligned + sw_affine_backtrack(query, seqs[start: stop], gap_open=gap_open, gap_extend=gap_extend)[-1]
+        pbar.set_description(f'dblen={len(seqs[start])}')
     # merge into one list, then sort by score
     scores = [a['score'] for a in aligned]
     aligned = [aligned[i] for i in np.argsort(scores)[::-1]]

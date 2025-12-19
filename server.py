@@ -13,6 +13,8 @@ import io, tarfile
 import argparse
 
 # parse command line arguments
+# todo 
+# [ ] modify this without reloading dataset -- have homepage write defaults? 
 parser = argparse.ArgumentParser(description="Run MSA Server")
 parser.add_argument("-port", '-p', default=8000, type=int, help="Port for server. ")
 parser.add_argument("-msa_num", default=4096, type=int, help='Max number of lines in MSA')
@@ -21,6 +23,10 @@ parser.add_argument("-msa_top_fft", default=200, type=int, help='')
 parser.add_argument("-msa_top_sw", default=10, type=int, help='')
 parser.add_argument("-msa_top_sw_affine", default=2, type=int, help='')
 args, _ = parser.parse_known_args()
+
+# fail fast on loading server (do before loading >100gb data)
+if __name__ == "__main__":
+    uvicorn.run("server:app", host="0.0.0.0", port=args.port, reload=False, access_log=False)
 
 # setup folder structure/app/env variables
 os.makedirs('requests/', exist_ok=True)
@@ -109,7 +115,7 @@ async def upload(files: list[UploadFile] | None = File(None), args: str = Form("
         
         # Run boltz and wait for completion, capturing output
         # Build command with optional args
-        cmd = f"boltz predict requests/{num}/fastas/  --output_format pdb --use_msa_server --msa_server_url http://localhost:8000 --out_dir requests/{num}/"
+        cmd = f"boltz predict requests/{num}/fastas/  --output_format pdb --use_msa_server --msa_server_url http://localhost:{args.port} --out_dir requests/{num}/"
         if args.strip():
             cmd += f" {args}"
         
@@ -153,11 +159,13 @@ async def ticket_msa(request: Request, q: str = Form(...)):
     if msa_lock.locked():
         return Response(status_code=503, content="msa busy - please wait a bit")
     
+    file_hash = hashlib.sha256(str(q).encode('utf-8')).hexdigest()
     q = str(q).split('\n')
 
     # cache results in folder specific to options. 
     cache_folder = f"{chunks}_{args.msa_num}_{args.msa_top_fft}_{args.msa_fft_rank}_{args.msa_top_sw}_{args.msa_top_sw_affine}"
     os.makedirs(f"cache_msa/{cache_folder}/", exist_ok=True)
+    os.makedirs(f"cache_msa/{cache_folder}/tar/", exist_ok=True)
 
     # fetch all proteins from input 
     heads, proteins = q[::2], q[1::2]
@@ -198,10 +206,11 @@ async def ticket_msa(request: Request, q: str = Form(...)):
     uniref_content = b"\x00\n".join(Path(p).read_bytes() for p in out_paths)
 
     # satisfy the output format
-    tar_id = protein_hash 
-    tar_path = Path(tar_id.replace('.a3m','_tar'))
+    tar_id = f"cache_msa/{cache_folder}/tar/{file_hash}"
+    print(tar_id)
+    tar_path = Path(tar_id)
     tar_path.mkdir(exist_ok=True)
-    tar_file = tar_path / f"{tar_id}.tar.gz"
+    tar_file = tar_path / f"{file_hash}.tar.gz"
 
     with tarfile.open(tar_file, "w:gz") as tar:
         is_pair = request.url.path.endswith("/ticket/pair")
@@ -269,5 +278,3 @@ async def get_status():
 async def protboard():
     return open('protboard.html', 'r').read() 
 
-if __name__ == "__main__":
-    uvicorn.run("server:app", host="0.0.0.0", port=args.port, reload=False, access_log=False)

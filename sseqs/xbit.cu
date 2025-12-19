@@ -68,6 +68,7 @@ void decompress_launcher(const uint8_t* d_in, uint8_t* d_out, int n_syms, int lo
     dim3 grid((n_syms/8 + BLOCK - 1) / BLOCK);
     d_in = d_in + lo; // d_in[lo:]
     decompress_kernel<<<grid, BLOCK, 0>>>(d_in, d_out, n_syms, lo);
+    cudaDeviceSynchronize();  // Force sync to ensure decompression completes
 }
 
 extern "C"

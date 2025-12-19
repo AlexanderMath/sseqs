@@ -1,26 +1,391 @@
+'''
+python sseqs/sw.py -test_sw
+compiled 52.912479639053345
+✅ seqs=100000  qlen=256        db_len=50       acc=100/100     TCUPs: 1.27±0.191       time: 0.97±0.15ms       103.08M seqs/s
+✅ seqs=100000  qlen=256        db_len=65       acc=100/100     TCUPs: 1.71±0.005       time: 0.93±0.00ms       107.74M seqs/s
+✅ seqs=100000  qlen=256        db_len=110      acc=100/100     TCUPs: 2.53±0.006       time: 1.08±0.00ms       92.35M seqs/s
+✅ seqs=100000  qlen=256        db_len=129      acc=100/100     TCUPs: 2.23±0.004       time: 1.44±0.00ms       69.24M seqs/s
+✅ seqs=100000  qlen=256        db_len=250      acc=100/100     TCUPs: 3.28±0.004       time: 1.93±0.00ms       51.80M seqs/s
+✅ seqs=100000  qlen=327        db_len=138      acc=100/100     TCUPs: 2.44±0.001       time: 1.81±0.00ms       55.25M seqs/s
+✅ seqs=100000  qlen=77 db_len=67       acc=100/100     TCUPs: 1.44±0.002       time: 0.34±0.00ms       292.82M seqs/s
+✅ seqs=100000  qlen=128        db_len=67       acc=100/100     TCUPs: 1.61±0.010       time: 0.51±0.00ms       196.89M seqs/s
+✅ seqs=100000  qlen=1024       db_len=1024     acc=100/100     TCUPs: 4.65±0.002       time: 22.47±0.01ms      4.45M seqs/s
+✅ seqs=100000  qlen=128        db_len=128      acc=100/100     TCUPs: 2.73±0.003       time: 0.59±0.00ms       170.56M seqs/s
+✅ seqs=100000  qlen=1024       db_len=256      acc=100/100     TCUPs: 3.70±0.000       time: 7.00±0.00ms       14.28M seqs/s
+✅ seqs=100000  qlen=256        db_len=1024     acc=100/100     TCUPs: 4.22±0.005       time: 6.20±0.01ms       16.13M seqs/s
+✅ seqs=100000  qlen=137        db_len=512      acc=100/100     TCUPs: 3.58±0.011       time: 1.95±0.01ms       51.32M seqs/s
+✅ seqs=100000  qlen=777        db_len=512      acc=100/100     TCUPs: 4.07±0.000       time: 9.71±0.00ms       10.30M seqs/s
+'''
 import torch as th 
 import triton
 import triton.language as tl
-
+import time 
+from icecream import ic
+import numpy as np 
 # wrapper for cuda code, allow using optimized CUDA kernel easily from python. 
 from torch.utils.cpp_extension import load
 import os 
+
+# Auto-detect GPU and compile only for that architecture
+if th.cuda.is_available():
+    major, minor = th.cuda.get_device_capability()
+    os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
+
 package_dir = os.path.dirname(os.path.abspath(__file__))
-sseqs_sw_ext = load(name="sseqs_sw_ext", sources=[f"{package_dir}/sw_bind.cpp", f"{package_dir}/sw.cu"], extra_cuda_cflags=["-O3", "--use_fast_math"],  extra_cflags=["-O3"])
-def sw(query: str, targets: list[str], gap_open=11, gap_extend=1):
+t0 = time.time()
+#sseqs_sw_ext = load(name="sseqs_sw_ext", sources=[f"{package_dir}/sw_bind.cpp", f"{package_dir}/sw.cu"], extra_cuda_cflags=["-O3", "--use_fast_math"],  extra_cflags=["-O3"], verbose=True)
+#sseqs_sw_ext = load(name="sseqs_sw_ext", sources=[f"{package_dir}/sw_bind.cpp", f"{package_dir}/sw.cu"], verbose=True)# , extra_cuda_cflags=["--use_fast_math"],  extra_cflags=["-O3"])
+sseqs_sw_ext = load("sw",   sources=[f"{package_dir}/sw_bind.cpp",     f"{package_dir}/sw.cu"],     extra_cuda_cflags=["-O3", "--use_fast_math"], extra_cflags=["-O3"], verbose=True)
+print('compiled', time.time()-t0)
+def sw(query: str, targets: list[str], db_len: int, gap_open=11, gap_extend=1, benchmark=False):
+    # Pad targets to multiple of 16 for efficient CUDA processing
+    SEQS_PER_BLOCK = 16
+    original_len = len(targets)
+    remainder = len(targets) % SEQS_PER_BLOCK
+    if remainder != 0:
+        pad_count = SEQS_PER_BLOCK - remainder
+        targets = targets + [targets[-1]] * pad_count
+    
+    _q_tensor = th.tensor([AA_MAP[aa] for aa in query if aa in AA_MAP], dtype=th.uint8, device="cuda")
+    # ASCII concatenation - single string join then one numpy call
+    joined = '@'.join(targets) + '@'
+    ascii_np = np.frombuffer(joined.encode('latin1'), dtype=np.uint8).copy()  # .copy() makes it writable
+    ascii = th.from_numpy(ascii_np).cuda()
+    
+    delimiter = 64
+    starts = th.nonzero(ascii == delimiter, as_tuple=False).flatten()
+    starts = th.cat([th.tensor([-1], dtype=th.int32, device="cuda"), starts])
+    good_idx = th.arange(1, len(targets)+1, dtype=th.int32, device="cuda")
+    th.cuda.synchronize()
+    start_event = th.cuda.Event(enable_timing=True)
+    end_event = th.cuda.Event(enable_timing=True)
+    times = []
+    for _ in range(3 if benchmark else 1):
+        start_event.record()
+        r = sseqs_sw_ext.sw_cuda_affine(
+            _q_tensor,
+            good_idx,
+            ascii,
+            starts.to(th.int32),
+            db_len,
+            gap_open=gap_open,
+            gap_extend=gap_extend
+        )
+        end_event.record()
+        th.cuda.synchronize()
+        t = start_event.elapsed_time(end_event) 
+        times.append(t)
+   
+    # Return only the original number of results (excluding padding)
+    return r[:original_len], times
+
+
+def sw_linear(query: str, targets: list[str], db_len: int, gap_penalty=1, benchmark=False):
+    """Smith-Waterman with linear gap penalties (for screening/prefilter)"""
+    SEQS_PER_BLOCK = 16
+    original_len = len(targets)
+    remainder = len(targets) % SEQS_PER_BLOCK
+    if remainder != 0:
+        pad_count = SEQS_PER_BLOCK - remainder
+        targets = targets + [targets[-1]] * pad_count
+    
+    _q_tensor = th.tensor([AA_MAP[aa] for aa in query if aa in AA_MAP], dtype=th.uint8, device="cuda")
+    joined = '@'.join(targets) + '@'
+    ascii_np = np.frombuffer(joined.encode('latin1'), dtype=np.uint8).copy()
+    ascii = th.from_numpy(ascii_np).cuda()
+    
+    delimiter = 64
+    starts = th.nonzero(ascii == delimiter, as_tuple=False).flatten()
+    starts = th.cat([th.tensor([-1], dtype=th.int32, device="cuda"), starts])
+    good_idx = th.arange(1, len(targets)+1, dtype=th.int32, device="cuda")
+    th.cuda.synchronize()
+    start_event = th.cuda.Event(enable_timing=True)
+    end_event = th.cuda.Event(enable_timing=True)
+    times = []
+    for _ in range(3 if benchmark else 1):
+        start_event.record()
+        r = sseqs_sw_ext.sw_cuda_linear(
+            _q_tensor,
+            good_idx,
+            ascii,
+            starts.to(th.int32),
+            db_len,
+            gap_penalty=gap_penalty
+        )
+        end_event.record()
+        th.cuda.synchronize()
+        t = start_event.elapsed_time(end_event) 
+        times.append(t)
+   
+    return r[:original_len], times
+
+
+def sw_uint8(query: str, targets: list[str], gap_open=11, gap_extend=1, benchmark=False):
+    """Smith-Waterman with uint8 SIMD (for screening, may overflow on high scores)"""
+    # Pad targets to multiple of SEQS_PER_BLOCK for int8 kernel
+    # (256 threads / 32) * (32 / 8) * 4 = 128 sequences per block (for db_len=128)
+    SEQS_PER_BLOCK = 128
+    original_len = len(targets)
+    remainder = len(targets) % SEQS_PER_BLOCK
+    if remainder != 0:
+        pad_count = SEQS_PER_BLOCK - remainder
+        targets = targets + [targets[-1]] * pad_count
+    
+    _q_tensor = th.tensor([AA_MAP[aa] for aa in query if aa in AA_MAP], dtype=th.uint8, device="cuda")
+    # ASCII concatenation - single string join then one numpy call
+    joined = '@'.join(targets) + '@'
+    ascii_np = np.frombuffer(joined.encode('latin1'), dtype=np.uint8).copy()  # .copy() makes it writable
+    ascii = th.from_numpy(ascii_np).cuda()
+    
+    delimiter = 64
+    starts = th.nonzero(ascii == delimiter, as_tuple=False).flatten()
+    starts = th.cat([th.tensor([-1], dtype=th.int32, device="cuda"), starts])
+    good_idx = th.arange(1, len(targets)+1, dtype=th.int32, device="cuda")
+    th.cuda.synchronize()
+    start_event = th.cuda.Event(enable_timing=True)
+    end_event = th.cuda.Event(enable_timing=True)
+    times = []
+    for _ in range(5 if benchmark else 1):
+        start_event.record()
+        r = sseqs_sw_ext.sw_cuda_affine_uint8(
+            _q_tensor,
+            good_idx,
+            ascii,
+            starts.to(th.int32),
+            gap_open=gap_open,
+            gap_extend=gap_extend
+        )
+        end_event.record()
+        th.cuda.synchronize()
+        t = start_event.elapsed_time(end_event) 
+        times.append(t)
+  
+    # Return only the original number of results (excluding padding)
+    return r[:original_len], times
+
+
+def sw_antidiag(query: str, targets: list[str], gap_open=11, gap_extend=1, benchmark=False):
+    """ Smith-Waterman with affine gap penalties using anti-diagonal parallelization.
+    
+    Args:
+        query: Query sequence string
+        targets: List of target sequence strings
+        gap_open: Gap opening penalty (default: 11)
+        gap_extend: Gap extension penalty (default: 1)
+        benchmark: If True, compute and print TCUPs (default: False)
+    
+    Returns:
+        torch.Tensor of scores for each target sequence
+    """
     _q_tensor = th.tensor([AA_MAP[aa] for aa in query if aa in AA_MAP], dtype=th.uint8, device="cuda")
     ascii = th.hstack([th.tensor([ord(c) for c in target+'@'], dtype=th.uint8, device="cuda") for target in targets])
     delimiter = 64
     starts = th.nonzero(ascii == delimiter, as_tuple=False).flatten()
-    good_idx = th.arange(len(targets), dtype=th.int32, device="cuda")
-    return sseqs_sw_ext.sw_cuda_affine(
-        _q_tensor,
-        good_idx,
-        ascii,
-        starts.to(th.int32),
-        gap_open=gap_open,
-        gap_extend=gap_extend
-    )
+    starts = th.cat([th.tensor([-1], dtype=th.int32, device="cuda"), starts])
+    good_idx = th.arange(1, len(targets)+1, dtype=th.int32, device="cuda")
+    th.cuda.synchronize()
+    for _ in range(2):
+        t0 = time.time()
+        r = sseqs_sw_ext.sw_cuda_affine_antidiag(
+            _q_tensor,
+            good_idx,
+            ascii,
+            starts.to(th.int32),
+            gap_open=gap_open,
+            gap_extend=gap_extend
+        )
+        th.cuda.synchronize()
+        t = time.time() - t0
+        #print(t)
+        if benchmark:
+            total_cell_updates = len(query) * sum(len(target) for target in targets)
+            tcups = total_cell_updates / t / 1e12
+            total_tokens = sum(len(target) for target in targets)
+            print(f"sw_antidiag TCUPs: {tcups:.2f}, time: {t:.4f}s, sequences: {len(targets)}, total_tokens: {total_tokens}")
+    return r, t
+
+
+def sw_profile(pssm: th.Tensor, targets: list[str], gap_open=11, gap_extend=1, benchmark=False):
+    """Smith-Waterman with PSSM (profile) scoring instead of BLOSUM62.
+    
+    Args:
+        pssm: Position-specific scoring matrix, shape (query_len, 20), torch.Tensor (int8, CUDA)
+        targets: List of target sequence strings
+        gap_open: Gap opening penalty (default: 11)
+        gap_extend: Gap extension penalty (default: 1)
+        benchmark: If True, run multiple times for timing (default: False)
+    
+    Returns:
+        torch.Tensor of scores for each target sequence, list of times
+    """
+    import numpy as np
+    
+    # Ensure PSSM is int8 on CUDA
+    if not pssm.is_cuda:
+        pssm = pssm.cuda()
+    if pssm.dtype != th.int8:
+        pssm = pssm.to(th.int8)
+    
+    query_len = pssm.shape[0]
+    
+    # Pad targets to multiple of SEQS_PER_BLOCK
+    SEQS_PER_BLOCK = 64  # Same as affine kernel
+    original_len = len(targets)
+    remainder = len(targets) % SEQS_PER_BLOCK
+    if remainder != 0:
+        pad_count = SEQS_PER_BLOCK - remainder
+        targets = targets + [targets[-1]] * pad_count
+    
+    # Compute max target length for dispatch
+    target_len = max(len(t) for t in targets)
+    
+    # Build concatenated ASCII sequences with delimiter
+    joined = '@'.join(targets) + '@'
+    ascii_np = np.frombuffer(joined.encode('latin1'), dtype=np.uint8).copy()
+    ascii = th.from_numpy(ascii_np).cuda()
+    
+    delimiter = 64  # '@' 
+    starts = th.nonzero(ascii == delimiter, as_tuple=False).flatten()
+    starts = th.cat([th.tensor([-1], dtype=th.int32, device="cuda"), starts])
+    good_idx = th.arange(1, len(targets)+1, dtype=th.int32, device="cuda")
+    
+    th.cuda.synchronize()
+    start_event = th.cuda.Event(enable_timing=True)
+    end_event = th.cuda.Event(enable_timing=True)
+    times = []
+    
+    for _ in range(3 if benchmark else 1):
+        start_event.record()
+        r = sseqs_sw_ext.sw_cuda_profile(
+            pssm,
+            good_idx,
+            ascii,
+            starts.to(th.int32),
+            target_len,
+            gap_open=gap_open,
+            gap_extend=gap_extend
+        )
+        end_event.record()
+        th.cuda.synchronize()
+        t = start_event.elapsed_time(end_event) / 1000.0  # Convert ms to seconds
+        times.append(t)
+    
+    return r[:original_len], times
+
+
+def sw_affine_backtrack_cuda(query: str, targets: list[str], gap_open=11, gap_extend=1):
+    """CUDA implementation with checkpointing for memory-efficient backtracking."""
+    _q_tensor = th.tensor([AA_MAP[aa] for aa in query if aa in AA_MAP], dtype=th.uint8, device="cuda")
+    ascii = th.hstack([th.tensor([ord(c) for c in target+'@'], dtype=th.uint8, device="cuda") for target in targets])
+    delimiter = 64
+    starts = th.nonzero(ascii == delimiter, as_tuple=False).flatten()
+    starts = th.cat([th.tensor([-1], dtype=th.int32, device="cuda"), starts])
+    good_idx = th.arange(1, len(targets)+1, dtype=th.int32, device="cuda")
+    
+    max_align_len = len(query) + max(len(t) for t in targets)
+    import time 
+    for _ in range(1):
+        t0 = time.time()
+        scores, align_lens, end_i, end_j, align_ops = sseqs_sw_ext.sw_cuda_affine_backtrack(
+            _q_tensor,
+            good_idx,
+            ascii,
+            starts.to(th.int32),
+            max_align_len,
+            gap_open,
+            gap_extend
+        )
+        th.cuda.synchronize()
+        t= time.time()-t0
+        ic(t)
+    
+    # Reconstruct aligned sequences from operations
+    alignments = []
+    for i in range(len(targets)):
+        alen = align_lens[i].item()
+        if alen == 0:
+            alignments.append({'q_aligned': '', 't_aligned': '', 'score': scores[i].item()})
+            continue
+            
+        ops = align_ops[i, :alen].cpu().numpy().tobytes().decode('latin-1')
+        
+        # CUDA DP indexing: When at cell (i, j) and we take a MATCH, we consume target[i] and query[j]
+        # The end positions from CUDA are the (i, j) of the last cell in the alignment
+        # So the last MATCH consumed target[end_i] and query[end_j]
+        # 
+        # Working backwards through the operations:
+        # - Each MATCH: consume both target and query (i--, j--)
+        # - Each INSERT: consume only query (j--)
+        # - Each DELETE: consume only target (i--)
+        #
+        # After we've gone through all operations backward, we're at the cell BEFORE the first operation
+        # So we need to add 1 to get the index of the first character consumed
+        
+        # Calculate the position before the first operation
+        q_before, t_before = end_j[i].item(), end_i[i].item()
+        for op in ops:
+            if op == 'M':
+                q_before -= 1
+                t_before -= 1
+            elif op == 'I':
+                q_before -= 1
+            elif op == 'D':
+                t_before -= 1
+        
+        # The start position is one after the "before" position
+        q_start, t_start = q_before + 1, t_before + 1
+        
+        # DEBUG: Print for first sequence
+        if i == 0 and False:  # Disable debug output
+            print(f"\n=== DEBUG Seq {i} ===")
+            print(f"Target: {targets[i]}")
+            print(f"Query:  {query}")
+            print(f"Ops: {ops}")
+            print(f"End pos: t={end_i[i].item()} q={end_j[i].item()}")
+            print(f"Start pos: t={t_start} q={q_start}")
+            print(f"Target substring [{t_start}:{end_i[i].item()}]: {targets[i][t_start:end_i[i].item()]}")
+            print(f"Query substring [{q_start}:{end_j[i].item()}]: {query[q_start:end_j[i].item()]}")
+            print(f"\nTrying different interpretations:")
+            print(f"  [{t_start}:{end_i[i].item()+1}] vs [{q_start}:{end_j[i].item()+1}]:")
+            print(f"    Target: {targets[i][t_start:end_i[i].item()+1]}")
+            print(f"    Query:  {query[q_start:end_j[i].item()+1]}")
+            print(f"  [{t_start+1}:{end_i[i].item()+1}] vs [{q_start+1}:{end_j[i].item()+1}]:")
+            print(f"    Target: {targets[i][t_start+1:end_i[i].item()+1]}")
+            print(f"    Query:  {query[q_start+1:end_j[i].item()+1]}")
+        
+        # Now build alignment going FORWARD from start position
+        q_aln, t_aln = [], []
+        q_pos, t_pos = q_start, t_start
+        
+        for op in ops:
+            if op == 'M':  # Match/mismatch
+                if q_pos >= 0 and t_pos >= 0 and q_pos < len(query) and t_pos < len(targets[i]):
+                    q_aln.append(query[q_pos])
+                    t_aln.append(targets[i][t_pos])
+                q_pos += 1
+                t_pos += 1
+            elif op == 'I':  # Insertion in query (gap in target)
+                if q_pos >= 0 and q_pos < len(query):
+                    q_aln.append(query[q_pos])
+                    t_aln.append('-')
+                q_pos += 1
+            elif op == 'D':  # Deletion in query (gap in query)
+                if t_pos >= 0 and t_pos < len(targets[i]):
+                    q_aln.append('-')
+                    t_aln.append(targets[i][t_pos])
+                t_pos += 1
+        
+        if i == 0:
+            print(f"Extracted q_aln: {repr(''.join(q_aln))}")
+            print(f"Extracted t_aln: {repr(''.join(t_aln))}")
+        
+        alignments.append({
+            'q_aligned': ''.join(q_aln),
+            't_aligned': ''.join(t_aln),
+            'score': scores[i].item()
+        })
+    
+    return scores, alignments, t
 
 # @alex: code below used to build .a3m file not search DB.
 # it needs backtracking -- this is just quick&dirty triton, should rewrite to CUDA. 
@@ -563,9 +928,6 @@ def sw_diag_batch_affine(
     tl.store(best_scores_ptr + pid, best_score_new)
 
 
-
-
-
 @triton.jit
 def backtrack_kernel_batched_affine(
     # Input DP matrices & sequences
@@ -765,4 +1127,551 @@ def backtrack_kernel_batched_affine(
                 tl.store(out_q_start_0based_ptr + pid, curr_i_1based) 
                 tl.store(out_t_start_0based_ptr + pid, curr_j_1based) 
                 tl.store(out_q_end_0based_ptr + pid, q_idx_end_1based - 1) 
-                tl.store(out_t_end_0based_ptr + pid, t_idx_end_1based - 1) 
+                tl.store(out_t_end_0based_ptr + pid, t_idx_end_1based - 1)
+
+eval_file = f'eval/runs_and_poses/raw_us7/raw_us7/7fak__1__1.A__1.B.pkl'
+eval_file = f"eval/runs_and_poses/low_homology_raw_all/553a03b7ac0b44b7a6293d3c90bfae1df25d04291fe784db5b38f87afcb88344.pkl"
+
+def test_sw(profile):
+    import pickle 
+    import numpy as np 
+    import parasail
+    import torch
+    np.random.seed(42)
+    # if we could train a int4 NN we could get 60 TCUPs; this is faster than PCIE i guess? 
+    
+    # wget foldify.org/test_case.pkl #  80mb of hits
+    q, seqs, scores = pickle.load(open(eval_file, 'rb'))
+    seqs = [s.decode('ascii') for s in seqs]
+    q = q * 3
+    seqs = sorted(seqs, key=len)[::-1]
+    seqs = [s*10 for s in seqs[:100_000]] 
+    seqs = [s.replace('@','').replace('B', '').replace('X', '').replace('-','').replace('*','') for s in seqs if len(s)>1024]
+   
+    for num, (target_len, query_len) in enumerate([
+        [50,       256],
+        [65,       256],
+        [110,      256],
+        [129,      256],
+        [250,      256],
+        [138,       327],
+        [67,       77],
+        [67,       128],
+        [1024,     1024],
+        #[5,         7],
+        #[129,       128],
+        [128,       128],
+        [256,       1024],
+        [1024,      256],
+        [512,      137],
+        [512,      777],
+       ]):
+        # Prepare sequences
+        targets = [s[:target_len+np.random.randint(-5, 0)] for s in seqs]
+        query = q[:query_len]
+        
+        # Benchmark CUDA on all sequences
+        scores_cuda, times = sw(query, targets, target_len, benchmark=True, gap_open=11, gap_extend=1)
+        
+        # Compute TCUPs stats (skip first cold run)
+        times_arr = np.array(times[1:]) / 1000.0  # Convert ms to seconds for TCUPs
+        median_t = np.median(times_arr)
+        std_t = np.std(times_arr)
+        total_cell_updates = len(query) * sum(len(target) for target in targets)
+        tcups_arr = total_cell_updates / times_arr / 1e12
+        median_tcups = np.median(tcups_arr)
+        std_tcups = np.std(tcups_arr)
+        
+        # Validate on random sample
+        n_validate = 100
+        validate_indices = np.random.choice(len(targets), size=min(n_validate, len(targets)), replace=False)
+        scores_parasail = []
+        for i in validate_indices:
+            result = parasail.sw_trace(query, targets[i], 11, 1, parasail.blosum62)
+            scores_parasail.append(result.score)
+        scores_parasail = torch.tensor(scores_parasail, device='cuda')
+        
+        # Check accuracy (allow tolerance for FP16 precision in large alignments)
+        scores_cuda_sampled = scores_cuda[validate_indices]
+        diff = (scores_cuda_sampled - scores_parasail).abs()
+        rel_error = diff / scores_parasail.float()
+        exact_matches = (rel_error < 0.03).sum().item()
+        acc_emoji = "✅" if exact_matches == n_validate else "❌"
+        
+        # If not 100% accurate, report errors
+        if exact_matches != n_validate:
+            wrong_indices = (rel_error >= 0.03).nonzero(as_tuple=True)[0]
+            print(f"  Errors found in {len(wrong_indices)} sequences:")
+            for idx in wrong_indices[:10]:  # Show first 10 errors
+                i = idx.item()
+                cuda_score = scores_cuda_sampled[i].item()
+                parasail_score = scores_parasail[i].item()
+                error = rel_error[i].item()
+                print(f"    idx={validate_indices[i]}: CUDA={cuda_score:.1f} Parasail={parasail_score:.1f} rel_err={error:.3f}")
+            if len(wrong_indices) > 10:
+                print(f"    ... and {len(wrong_indices) - 10} more errors")
+        
+        # Compute sequences per second
+        seqs_per_sec = len(targets) / median_t / 1e6  # In millions
+        
+        # Single line output (times back to ms for display)
+        print(f"{acc_emoji} seqs={len(targets)}\tqlen={query_len}\tdb_len={target_len}\tacc={exact_matches}/{n_validate}\tTCUPs: {median_tcups:.2f}±{std_tcups:.3f}\ttime: {median_t*1000:.2f}±{std_t*1000:.2f}ms\t{seqs_per_sec:.2f}M seqs/s")
+        if profile: exit()
+
+
+def test_sw_backtrack(profile):
+    """Test SW with backtracking"""
+    import pickle 
+    import numpy as np 
+    import parasail
+    import torch 
+    np.random.seed(42)
+    # 5TCUPs = 4m seqs/s.  i just want ~2m for backtrack.
+    
+    print("Testing SW Backtrack (sw_affine_backtrack_cuda)")
+    print("=" * 80)
+    
+    # Load test data
+    q, seqs, scores = pickle.load(open(eval_file, 'rb'))
+    seqs = [seq.decode('ascii') for seq in seqs]
+    seqs = [s.replace('@','').replace('B', '').replace('X', '').replace('-','').replace('*','') for s in seqs if len(s)>50]
+    seqs = [s[:1024] for s in seqs]
+    
+    # Sort by length (longest first)
+    seqs = sorted(seqs, key=len, reverse=True)
+    seqs = seqs[:10]  # Test on 10 sequences only
+    query = q[:256]
+    from icecream import ic 
+    ic(seqs)
+    ic(query)
+    
+    print(f"Query length: {len(query)}")
+    print(f"Testing on {len(seqs)} sequences")
+    print(f"Target lengths: {[len(s) for s in seqs[:10]]}")
+    
+    # First test: Forward pass scores should match parasail
+    print("\n=== Test 1: Forward Pass Scores ===")
+    print("Comparing backtrack kernel scores vs parasail...")
+    
+    # Run CUDA backtrack kernel
+    scores_backtrack, alignments, t = sw_affine_backtrack_cuda(query, seqs)
+    print(t)
+    
+    # Get parasail reference scores
+    import parasail
+    scores_parasail = []
+    alignments_parasail = []
+    for seq in seqs:
+        result = parasail.sw_trace(query, seq, 11, 1, parasail.blosum62)
+        scores_parasail.append(result.score)
+        
+        # Get the actual alignment from parasail for comparison
+        if len(alignments_parasail) < 1:  # Just first one for debug
+            cigar = result.cigar
+            alignments_parasail.append({
+                'score': result.score,
+                'end_ref': result.end_ref,
+                'end_query': result.end_query,
+                'len_ref': result.len_ref,
+                'len_query': result.len_query,
+                'cigar': cigar.decode if hasattr(cigar, 'decode') else str(cigar)
+            })
+    scores_parasail = torch.tensor(scores_parasail, device='cuda')
+    
+    print(f"Parasail scores:     {scores_parasail.cpu().numpy()[:10]}")
+    print(f"Backtrack SW scores: {scores_backtrack.cpu().numpy()[:10]}")
+    
+    # DEBUG: Show parasail's alignment for first sequence
+    if alignments_parasail:
+        p = alignments_parasail[0]
+        print(f"\nParasail alignment for seq 0:")
+        print(f"  Score: {p['score']}")
+        print(f"  end_ref: {p['end_ref']}, end_query: {p['end_query']}")
+        print(f"  len_ref: {p['len_ref']}, len_query: {p['len_query']}")
+        ref_begin = p['end_ref'] - p['len_ref'] + 1
+        query_begin = p['end_query'] - p['len_query'] + 1
+        print(f"  Computed: ref_begin={ref_begin}, query_begin={query_begin}")
+        print(f"  Target: [{ref_begin}:{p['end_ref']+1}] = {seqs[0][ref_begin:p['end_ref']+1]}")
+        print(f"  Query:  [{query_begin}:{p['end_query']+1}] = {query[query_begin:p['end_query']+1]}")
+        print(f"  CIGAR: {p['cigar']}")
+    
+    # Compare scores (allow 2% relative difference)
+    score_diff = (scores_backtrack - scores_parasail).abs()
+    relative_diff = score_diff / (scores_parasail.abs() + 1e-6)  # Avoid division by zero
+    max_rel_diff = relative_diff.max().item()
+    max_abs_diff = score_diff.max().item()
+    matches = (relative_diff <= 0.02).sum().item()
+    
+    if matches == len(seqs):
+        print(f"✅ Forward pass: ALL scores match parasail within 2%! (max rel diff: {max_rel_diff*100:.2f}%, max abs diff: {max_abs_diff:.1f})")
+    else:
+        print(f"❌ Forward pass: {matches}/{len(seqs)} scores match parasail (max rel diff: {max_rel_diff*100:.2f}%)")
+        for i in range(len(seqs)):
+            if relative_diff[i] > 0.02:
+                rel_pct = relative_diff[i].item() * 100
+                print(f"  Seq {i}: Parasail={scores_parasail[i].item():.0f} Backtrack={scores_backtrack[i].item():.0f} diff={score_diff[i].item():.0f} ({rel_pct:.2f}%)")
+        print("\n❌ Forward pass scores don't match - fix the kernel before testing backtracking!")
+        return
+    
+    # Second test: Validate backtracking correctness
+    print("\n=== Test 2: Backtracking Correctness ===")
+    print("Testing: Does parasail agree our alignment achieves the claimed score?")
+    
+    for i in range(len(seqs)):
+        cuda_score = scores_backtrack[i].item()
+        
+        # Get pre-aligned sequences from CUDA backtrack
+        q_aligned = alignments[i]['q_aligned']
+        t_aligned = alignments[i]['t_aligned']
+        
+        # Remove gaps to get the actual subsequences that were aligned
+        q_nogap = q_aligned.replace('-', '')
+        t_nogap = t_aligned.replace('-', '')
+        
+        # Re-score using SW on the gap-free subsequences
+        result_rescore = parasail.sw_trace(q_nogap, t_nogap, 11, 1, parasail.blosum62)
+        parasail_rescore = result_rescore.score
+        
+        # Check if parasail agrees this alignment has the claimed score (allow 2% relative difference)
+        diff = abs(cuda_score - parasail_rescore)
+        rel_diff = diff / (abs(cuda_score) + 1e-6)
+        status = "✅" if rel_diff <= 0.02 else "❌"
+        
+        print(f"{status} Seq {i}: CUDA_score={cuda_score:.0f} Parasail_rescore={parasail_rescore:.0f} diff={diff:.0f} ({rel_diff*100:.2f}%) align_len={len(q_aligned)}")
+        
+        # Show details for failures
+        if rel_diff > 0.02:
+            print(f"  Query nogap:  {q_nogap[:30]}...")
+            print(f"  Target nogap: {t_nogap[:30]}...")
+            print(f"  Query aligned:  {q_aligned[:30]}...")
+            print(f"  Target aligned: {t_aligned[:30]}...")
+    
+    print("\n✅ Backtrack test complete!")
+
+
+def test_sw_linear(profile):
+    """Test linear gap penalty kernel"""
+    import pickle 
+    import numpy as np 
+    import parasail
+    import torch
+    np.random.seed(42)
+    
+    print("Testing Linear Gap Penalty Kernel (sw_kernel_linear)")
+    print("=" * 80)
+    
+    # Load test data
+    q, seqs, scores = pickle.load(open(eval_file, 'rb'))
+    q = q * 2
+    seqs = sorted(seqs, key=len)[::-1]
+    seqs = [s*5 for s in seqs[:100_000]] 
+    seqs = [s.replace('@','').replace('B', '').replace('X', '').replace('-','').replace('*','') for s in seqs if len(s)>128]
+   
+    for num, (target_len, query_len) in enumerate([
+        [128,      128],
+        [256,      256],
+        [512,      512],
+        [1024,     1024],
+       ]):
+        # Prepare sequences
+        targets = [s[:target_len+np.random.randint(-5, 0)] for s in seqs]
+        query = q[:query_len]
+        
+        # Benchmark CUDA linear kernel
+        scores_cuda_linear, times = sw_linear(query, targets, target_len, benchmark=True, gap_penalty=1)
+        
+        # Compute TCUPs stats
+        times_arr = np.array(times[1:]) / 1000.0
+        median_t = np.median(times_arr)
+        std_t = np.std(times_arr)
+        total_cell_updates = len(query) * sum(len(target) for target in targets)
+        tcups_arr = total_cell_updates / times_arr / 1e12
+        median_tcups = np.median(tcups_arr)
+        std_tcups = np.std(tcups_arr)
+        
+        # Validate against parasail with linear gaps
+        # Note: parasail doesn't have pure linear gaps, so we use affine with gap_open = gap_extend
+        n_validate = min(100, len(targets))
+        validate_indices = np.random.choice(len(targets), size=n_validate, replace=False)
+        scores_parasail = []
+        for i in validate_indices:
+            # Simulate linear gaps: set gap_open = gap_extend = 1
+            result = parasail.sw_trace(query, targets[i], 1, 1, parasail.blosum62)
+            scores_parasail.append(result.score)
+        scores_parasail = torch.tensor(scores_parasail, device='cuda')
+        
+        # Check accuracy
+        scores_cuda_sampled = scores_cuda_linear[validate_indices]
+        diff = (scores_cuda_sampled - scores_parasail).abs()
+        rel_error = diff / (scores_parasail.float() + 1e-6)
+        exact_matches = (rel_error < 0.03).sum().item()
+        acc_emoji = "✅" if exact_matches == n_validate else "❌"
+        
+        # Report any errors
+        if exact_matches != n_validate:
+            wrong_indices = (rel_error >= 0.03).nonzero(as_tuple=True)[0]
+            print(f"  Errors found in {len(wrong_indices)} sequences:")
+            for idx in wrong_indices[:5]:
+                i = idx.item()
+                cuda_score = scores_cuda_sampled[i].item()
+                parasail_score = scores_parasail[i].item()
+                error = rel_error[i].item()
+                print(f"    idx={validate_indices[i]}: CUDA={cuda_score:.1f} Parasail={parasail_score:.1f} rel_err={error:.3f}")
+        
+        seqs_per_sec = len(targets) / median_t / 1e6
+        
+        print(f"{acc_emoji} LINEAR seqs={len(targets)}\tqlen={query_len}\tdb_len={target_len}\tacc={exact_matches}/{n_validate}\tTCUPs: {median_tcups:.2f}±{std_tcups:.3f}\ttime: {median_t*1000:.2f}±{std_t*1000:.2f}ms\t{seqs_per_sec:.2f}M seqs/s")
+        if profile: exit()
+
+def sw_profile_reference(pssm, target, gap_open=11, gap_extend=1):
+    """Pure Python reference implementation for profile SW (slow but correct).
+    
+    Args:
+        pssm: numpy array (query_len, 20) - position-specific scoring matrix
+        target: string - target sequence
+        gap_open: gap opening penalty
+        gap_extend: gap extension penalty
+    
+    Returns:
+        Maximum SW score (int)
+    """
+    AA_ORDER = 'ARNDCQEGHILKMFPSTWYV'
+    aa_to_idx = {aa: i for i, aa in enumerate(AA_ORDER)}
+    
+    L = len(pssm)  # query length
+    T = len(target)
+    
+    # DP matrices
+    H = np.zeros((L + 1, T + 1), dtype=np.float32)
+    E = np.zeros((L + 1, T + 1), dtype=np.float32)  # horizontal gap (insertion in query)
+    F = np.zeros((L + 1, T + 1), dtype=np.float32)  # vertical gap (deletion in query)
+    
+    max_score = 0
+    for i in range(1, L + 1):
+        for j in range(1, T + 1):
+            # Get target amino acid index
+            t_char = target[j - 1]
+            t_idx = aa_to_idx.get(t_char, 0)  # default to 0 (Ala) for unknown
+            
+            # Match/mismatch score from PSSM
+            match = H[i-1, j-1] + pssm[i-1, t_idx]
+            
+            # Gap scores (affine)
+            E[i, j] = max(E[i, j-1] - gap_extend, H[i, j-1] - gap_open)
+            F[i, j] = max(F[i-1, j] - gap_extend, H[i-1, j] - gap_open)
+            
+            # Cell score
+            H[i, j] = max(0, match, E[i, j], F[i, j])
+            max_score = max(max_score, H[i, j])
+    
+    return int(max_score)
+
+
+def test_sw_profile(profile):
+    """Test Profile-based Smith-Waterman (PSSM scoring)"""
+    import pickle 
+    import numpy as np 
+    import torch 
+    np.random.seed(42)
+    
+    print("Testing Profile SW (sw_profile)")
+    print("=" * 80)
+    
+    # Load test data
+    q, seqs, scores = pickle.load(open(eval_file, 'rb'))
+    seqs = [seq.decode('ascii') for seq in seqs]
+    seqs = [s.replace('@','').replace('B', '').replace('X', '').replace('-','').replace('*','') for s in seqs if len(s) > 50]
+    
+    # Use smaller subset for testing
+    query = q[:128]  # shorter for faster Python reference
+    query_len = len(query)
+    
+    # Sort by length and filter to reasonable size
+    seqs = sorted(seqs, key=len, reverse=True)
+    target_len = 128  # shorter for faster Python reference
+    targets = [s[:target_len] for s in seqs if len(s) >= target_len][:10000]
+    
+    print(f"Query length: {query_len}")
+    print(f"Testing on {len(targets)} sequences")
+    print(f"Target length: {target_len}")
+    
+    AA_ORDER = 'ARNDCQEGHILKMFPSTWYV'
+    aa_to_idx = {aa: i for i, aa in enumerate(AA_ORDER)}
+    
+    blosum62 = np.array([
+        [ 4, -1, -2, -2,  0, -1, -1,  0, -2, -1, -1, -1, -1, -2, -1,  1,  0, -3, -2,  0],  # A
+        [-1,  5,  0, -2, -3,  1,  0, -2,  0, -3, -2,  2, -1, -3, -2, -1, -1, -3, -2, -3],  # R
+        [-2,  0,  6,  1, -3,  0,  0,  0,  1, -3, -3,  0, -2, -3, -2,  1,  0, -4, -2, -3],  # N
+        [-2, -2,  1,  6, -3,  0,  2, -1, -1, -3, -4, -1, -3, -3, -1,  0, -1, -4, -3, -3],  # D
+        [ 0, -3, -3, -3,  9, -3, -4, -3, -3, -1, -1, -3, -1, -2, -3, -1, -1, -2, -2, -1],  # C
+        [-1,  1,  0,  0, -3,  5,  2, -2,  0, -3, -2,  1,  0, -3, -1,  0, -1, -2, -1, -2],  # Q
+        [-1,  0,  0,  2, -4,  2,  5, -2,  0, -3, -3,  1, -2, -3, -1,  0, -1, -3, -2, -2],  # E
+        [ 0, -2,  0, -1, -3, -2, -2,  6, -2, -4, -4, -2, -3, -3, -2,  0, -2, -2, -3, -3],  # G
+        [-2,  0,  1, -1, -3,  0,  0, -2,  8, -3, -3, -1, -2, -1, -2, -1, -2, -2,  2, -3],  # H
+        [-1, -3, -3, -3, -1, -3, -3, -4, -3,  4,  2, -3,  1,  0, -3, -2, -1, -3, -1,  3],  # I
+        [-1, -2, -3, -4, -1, -2, -3, -4, -3,  2,  4, -2,  2,  0, -3, -2, -1, -2, -1,  1],  # L
+        [-1,  2,  0, -1, -3,  1,  1, -2, -1, -3, -2,  5, -1, -3, -1,  0, -1, -3, -2, -2],  # K
+        [-1, -1, -2, -3, -1,  0, -2, -3, -2,  1,  2, -1,  5,  0, -2, -1, -1, -1, -1,  1],  # M
+        [-2, -3, -3, -3, -2, -3, -3, -3, -1,  0,  0, -3,  0,  6, -4, -2, -2,  1,  3, -1],  # F
+        [-1, -2, -2, -1, -3, -1, -1, -2, -2, -3, -3, -1, -2, -4,  7, -1, -1, -4, -3, -2],  # P
+        [ 1, -1,  1,  0, -1,  0,  0,  0, -1, -2, -2,  0, -1, -2, -1,  4,  1, -3, -2, -2],  # S
+        [ 0, -1,  0, -1, -1, -1, -1, -2, -2, -1, -1, -1, -1, -2, -1,  1,  5, -2, -2,  0],  # T
+        [-3, -3, -4, -4, -2, -2, -3, -2, -2, -3, -2, -3, -1,  1, -4, -3, -2, 11,  2, -3],  # W
+        [-2, -2, -2, -3, -2, -1, -2, -3,  2, -1, -1, -2, -1,  3, -3, -2, -2,  2,  7, -1],  # Y
+        [ 0, -3, -3, -3, -1, -2, -2, -3, -3,  3,  1, -2,  1, -1, -2, -2,  0, -3, -1,  4],  # V
+    ], dtype=np.int8)
+    
+    # =====================================================
+    # Test 1: BLOSUM62-derived PSSM vs regular affine SW
+    # =====================================================
+    print("\n=== Test 1: BLOSUM62-derived PSSM vs Affine SW ===")
+    
+    # Build PSSM from query using BLOSUM62
+    pssm_blosum = np.zeros((query_len, 20), dtype=np.int8)
+    for i, q_char in enumerate(query):
+        if q_char in aa_to_idx:
+            q_idx = aa_to_idx[q_char]
+            pssm_blosum[i, :] = blosum62[q_idx, :]
+        else:
+            pssm_blosum[i, :] = 0
+    
+    print(f"BLOSUM-derived PSSM shape: {pssm_blosum.shape}")
+    
+    pssm_blosum_tensor = torch.from_numpy(pssm_blosum).cuda()
+    scores_profile_blosum, _ = sw_profile(pssm_blosum_tensor, targets)
+    scores_affine, _ = sw(query, targets, db_len=target_len)
+    
+    diff_blosum = (scores_profile_blosum - scores_affine).abs()
+    max_diff_blosum = diff_blosum.max().item()
+    matches_blosum = (diff_blosum == 0).sum().item()
+    
+    print(f"Exact matches: {matches_blosum}/{len(targets)}")
+    print(f"Max absolute difference: {max_diff_blosum}")
+    
+    # Print sample scores to verify they're not garbage
+    print(f"Sample scores (first 10): {scores_profile_blosum[:10].cpu().numpy()}")
+    
+    if max_diff_blosum == 0:
+        print(f"✅ Profile SW matches Affine SW with BLOSUM-derived PSSM!")
+    else:
+        print(f"❌ Differences found:")
+        wrong_idx = (diff_blosum > 0).nonzero(as_tuple=True)[0][:5]
+        for idx in wrong_idx:
+            i = idx.item()
+            print(f"  idx={i}: Profile={scores_profile_blosum[i].item()} Affine={scores_affine[i].item()}")
+    
+    # =====================================================
+    # Test 2: Random PSSM vs Python reference (cached)
+    # =====================================================
+    print("\n=== Test 2: Random PSSM vs Python Reference ===")
+    
+    # Generate random PSSM
+    np.random.seed(42)
+    pssm_random = np.random.randint(-4, 12, size=(query_len, 20)).astype(np.int8)
+    print(f"Random PSSM shape: {pssm_random.shape}, range: [{pssm_random.min()}, {pssm_random.max()}]")
+    
+    n_validate = 100
+    validate_targets = targets[:n_validate]
+    
+    # Check for cached reference scores
+    cache_file = f"{package_dir}/profile_ref.pkl"
+    cache_valid = False
+    
+    if os.path.exists(cache_file):
+        try:
+            cached = pickle.load(open(cache_file, 'rb'))
+            # Verify cache matches current test setup
+            if (cached['query_len'] == query_len and 
+                cached['target_len'] == target_len and 
+                cached['n_validate'] == n_validate and
+                np.array_equal(cached['pssm'], pssm_random) and
+                cached['targets'] == validate_targets):
+                scores_ref = cached['scores']
+                cache_valid = True
+                print(f"Loaded cached reference scores from {cache_file}")
+        except Exception as e:
+            print(f"Cache invalid: {e}")
+    
+    if not cache_valid:
+        print(f"Computing Python reference scores for {n_validate} sequences...")
+        scores_ref = []
+        for i, target in enumerate(validate_targets):
+            score = sw_profile_reference(pssm_random, target)
+            scores_ref.append(score)
+            if (i + 1) % 20 == 0:
+                print(f"  {i+1}/{n_validate}...")
+        scores_ref = np.array(scores_ref)
+        
+        # Save to cache
+        cache_data = {
+            'query_len': query_len,
+            'target_len': target_len,
+            'n_validate': n_validate,
+            'pssm': pssm_random,
+            'targets': validate_targets,
+            'scores': scores_ref
+        }
+        pickle.dump(cache_data, open(cache_file, 'wb'))
+        print(f"Saved reference scores to {cache_file}")
+    
+    # Run CUDA
+    pssm_random_tensor = torch.from_numpy(pssm_random).cuda()
+    scores_cuda, _ = sw_profile(pssm_random_tensor, validate_targets)
+    scores_cuda_np = scores_cuda.cpu().numpy()
+    
+    # Compare
+    diff_ref = np.abs(scores_cuda_np - scores_ref)
+    max_diff_ref = diff_ref.max()
+    exact_matches_ref = (diff_ref == 0).sum()
+    
+    print(f"Exact matches: {exact_matches_ref}/{n_validate}")
+    print(f"Max absolute difference: {max_diff_ref}")
+    
+    # Print sample scores to verify they're not garbage
+    print(f"Sample CUDA scores (first 10): {scores_cuda_np[:10]}")
+    print(f"Sample Ref  scores (first 10): {scores_ref[:10]}")
+    
+    if exact_matches_ref == n_validate:
+        print(f"✅ CUDA matches Python reference perfectly!")
+    else:
+        print(f"❌ Differences found:")
+        wrong_idx = np.where(diff_ref > 0)[0][:10]
+        for idx in wrong_idx:
+            print(f"  idx={idx}: CUDA={scores_cuda_np[idx]} Ref={scores_ref[idx]} diff={diff_ref[idx]}")
+    
+    # =====================================================
+    # Test 3: Performance benchmark
+    # =====================================================
+    print("\n=== Test 3: Performance ===")
+    scores_cuda, t = sw_profile(pssm_random_tensor, targets, benchmark=True)
+    
+    median_t = np.median(t)
+    tcups = (query_len * target_len * len(targets)) / median_t / 1e12
+    seqs_per_sec = len(targets) / median_t / 1e6
+    
+    print(f"Profile SW: TCUPs: {tcups:.2f}, {seqs_per_sec:.2f}M seqs/s, {median_t*1000:.2f}ms")
+    
+    if profile:
+        exit()
+
+
+
+if __name__ == '__main__':
+    import argparse 
+    parser = argparse.ArgumentParser(description="Run sequence alignment using SW algorithm.")
+    parser.add_argument("-profile", action="store_true", help="Profile the execution time.")
+    parser.add_argument("-n",  default=100_000, type=int, help="Number of sequences to test. ")
+    parser.add_argument("-test_sw",  action='store_true', help="Test SW used for search. ")
+    parser.add_argument("-test_swl",  action='store_true', help="Test SW Linear (screening kernel). ")
+    parser.add_argument("-test_swb",  action='store_true', help="Test SW affine backtrack (alignment kernel). ")
+    parser.add_argument("-test_sw_uint8",  action='store_true', help="Test SW linear uint8 (screening kernel). ")
+    parser.add_argument("-test_swp",  action='store_true', help="Test SW profile (screening kernel). ")
+    args = parser.parse_args()
+
+    if args.test_sw: test_sw(args.profile); exit()
+    if args.test_swl: test_sw_linear(args.profile); exit()
+    if args.test_swb: test_sw_backtrack(args.profile); exit()
+    if args.test_sw_uint8: test_sw_uint8(args.profile); exit()
+    if args.test_swp: test_sw_profile(args.profile); exit()
+
+    

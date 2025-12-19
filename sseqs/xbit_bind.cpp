@@ -28,9 +28,20 @@ torch::Tensor decompress_cuda(torch::Tensor input, int n, int lo) {
 }
 
 // -----------------------------------------------------------------------------
+// decompression with pre-allocated output (in-place)
+// -----------------------------------------------------------------------------
+void decompress_cuda_inplace(torch::Tensor input, torch::Tensor output, int n, int lo) {
+    input = input.to(torch::kCUDA, torch::kUInt8);
+    output = output.to(torch::kCUDA, torch::kUInt8);
+    TORCH_CHECK(output.size(0) >= n, "Output tensor too small");
+    decompress_launcher(input.data_ptr<uint8_t>(), output.data_ptr<uint8_t>(), n, lo);
+}
+
+// -----------------------------------------------------------------------------
 // pybind11 module
 // -----------------------------------------------------------------------------
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("compress",   &compress_cuda,   "xbit compress (CUDA)");
     m.def("decompress", &decompress_cuda, "xbit decompress (CUDA)");
+    m.def("decompress_inplace", &decompress_cuda_inplace, "xbit decompress into pre-allocated tensor (CUDA)");
 }

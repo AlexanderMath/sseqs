@@ -2,9 +2,96 @@
 #include <cuda_runtime.h>
 #include <stdint.h> // For uint8_t
 #include <cstdio>        
+#include <cuda_fp16.h>
 
-#define NUM_AMINO_ACIDS_CUDA 20
-__device__ int8_t blosum62_matrix_cuda_global[NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA] = {
+// Debug flag: set to 1 to enable debug printing in kernels
+#define DEBUG 0
+
+// this makes kernel 30% slower
+#define PRINT_DEBUG 0 
+
+// ============================================================================
+// COMPILE FLAGS - Enable/disable individual kernels for faster compilation
+// ============================================================================
+#define COMPILE_LINEAR         0  // sw_kernel_linear (FP16) (screening)
+#define COMPILE_AFFINE         1  // sw_kernel_affine (FP16)
+#define COMPILE_AFFINE_INT8    0  // sw_kernel_affine_int8 (screening)
+#define COMPILE_BACKTRACK      0  // sw_affine_backtrack_kernel
+#define COMPILE_PROFILE        1  // sw_profile_kernel
+
+// DEV MODE: Only compile 4 kernel sizes for fast iteration (5s compile vs 30s)
+#define DEV_MODE               0  // Set to 0 for production (all sizes)
+// ============================================================================
+
+#define NUM_AMINO_ACIDS_CUDA 21  // 20 amino acids + 1 padding character
+#define NUM_AMINO_ACIDS_CUDA_2 441  // 21*21
+
+// Combined 3D BLOSUM packed in 4-bit: [qchar][db0][db1] -> uint8_t with both scores
+// Low nibble = blosum[qchar][db0], high nibble = blosum[qchar][db1]
+// 20*20*20 = 8000 bytes
+__device__ uint8_t blosum62_3d_packed[NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA];
+
+// Combined BLOSUM: [qchar][db0][db1] -> half2(blosum[q][d0], blosum[q][d1])
+// 20*20*20 = 8000 half2 values = 32KB - fits in constant memory!
+__device__ __constant__ __half2 blosum62_combined_cuda_constant[NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA];
+__device__ __half2 blosum62_combined_cuda_global[NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA];
+
+// Int8 BLOSUM for screening: [qchar][db0*20 + db1] -> uint16 packing 2x int8 (s0, s1)
+// Layout: (int8_t s0, int8_t s1) packed as uint16 = (s1 << 8) | (s0 & 0xFF)
+// 20 * 20 * 20 = 8000 uint16 values = 16KB
+__device__ uint16_t blosum62_int8_combined_global[NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA];
+
+// Simple 2D BLOSUM as half (not int8_t) - 800 bytes
+__device__ half blosum62_as_half_global[NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA];
+
+// 4-bit packed BLOSUM62 UPPER TRIANGLE (symmetric, 210 values -> 105 bytes, fits in 27 registers as uint32_t)
+// Values offset by +4 to fit in 4 bits (0-15), subtract 4 after unpacking
+// Stored as upper triangle: blosum[i][j] where i <= j
+// Layout: [0,0], [0,1], [0,2], ..., [0,19], [1,1], [1,2], ..., [1,19], [2,2], ..., [19,19]
+__device__ __constant__ uint32_t blosum62_upper_triangle_packed[27] = {
+    // 210 values, 27 uint32_t - computed from BLOSUM62 matrix
+    0x43342238, 0x53233332, 0x12494214, 0x36214245, 0xa1213321, 
+    0x11544415, 0x20452124, 0x133641a1, 0x03431130, 0x31101d11, 
+    0x23312313, 0x21426932, 0x32343145, 0x25114292, 0xa2213431, 
+    0x42112002, 0x311c1122, 0x16223232, 0x32145168, 0x14628731, 
+    0x13953232, 0x49221343, 0x0a533332, 0x33b37522, 0x22158210, 
+    0xb16f4229, 0x00000083
+};
+
+// Row offsets for upper triangle indexing (precomputed)
+__device__ __constant__ int blosum_row_offsets[20] = {
+    0, 20, 39, 57, 74, 90, 105, 119, 132, 144, 
+    155, 165, 174, 182, 189, 195, 200, 204, 207, 209
+};
+
+// Device function to get upper triangle index (OPTIMIZED)
+__device__ __forceinline__ int blosum_upper_idx(int i, int j) {
+    if (i > j) { int tmp = i; i = j; j = tmp; }
+    return blosum_row_offsets[i] + (j - i);
+}
+
+// Device function to lookup from packed upper triangle (OPTIMIZED)
+__device__ __forceinline__ int8_t blosum_lookup_packed(const uint32_t* packed, int qchar, int dbchar) {
+    int idx = blosum_upper_idx(qchar, dbchar);
+    int reg_idx = idx >> 3;  // Divide by 8 (faster than /)
+    int bit_idx = (idx & 7) << 2;  // Modulo 8, then * 4 (faster than % and *)
+    uint32_t val = (packed[reg_idx] >> bit_idx) & 0xF;
+    return (int8_t)(val) - 4;  // Offset back to signed (-4 to +11)
+}
+
+// 4-bit packed BLOSUM62 lower triangle (symmetric, 210 values -> 105 bytes)
+// Values offset by +4 to fit in 4 bits (0-15), subtract 4 after unpacking
+__device__ __constant__ unsigned char blosum62_packed[105] = {
+    0x34, 0x4e, 0xe2, 0x66, 0xe2, 0x74, 0xc0, 0xe0, 0xe0, 0x98, 0x05, 0x91, 0x08, 0x62, 0x63, 0x02,
+    0x56, 0x03, 0x01, 0x06, 0xce, 0x66, 0x7d, 0x2c, 0xe1, 0x0c, 0xe3, 0xe1, 0x14, 0x09, 0xc9, 0x66,
+    0xce, 0x21, 0x10, 0xce, 0xce, 0x61, 0x0e, 0x10, 0xce, 0xec, 0x15, 0xe6, 0x16, 0x84, 0xc0, 0xc2,
+    0x41, 0xe5, 0x00, 0xc0, 0xce, 0xc0, 0xc1, 0xe1, 0xce, 0x01, 0xe5, 0x00, 0x00, 0xce, 0x41, 0xca,
+    0xe0, 0xe5, 0x01, 0x81, 0xc0, 0xc1, 0x0c, 0xe3, 0xe1, 0xe1, 0xc1, 0xc1, 0xe2, 0xe0, 0x04, 0x05,
+    0x0c, 0x0c, 0x04, 0xe5, 0x00, 0x0c, 0x0c, 0x06, 0xc0, 0x0b, 0xe0, 0x00, 0x34, 0x0c, 0x0c, 0xe5,
+    0xe1, 0xe1, 0xf2, 0x65, 0x0c, 0xe2, 0xe0, 0x26
+};
+
+__device__ const int8_t blosum62_matrix_cuda_global[NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA] = {
 //   A  R  N  D  C  Q  E  G  H  I  L  K  M  F  P  S  T  W  Y  V
      4,-1,-2,-2, 0,-1,-1, 0,-2,-1,-1,-1,-1,-2,-1, 1, 0,-3,-2, 0, // A
     -1, 5, 0,-2,-3, 1, 0,-2, 0,-3,-2, 2,-1,-3,-2,-1,-1,-3,-2,-3, // R
@@ -26,6 +113,31 @@ __device__ int8_t blosum62_matrix_cuda_global[NUM_AMINO_ACIDS_CUDA * NUM_AMINO_A
     -3,-3,-4,-4,-2,-2,-3,-2,-2,-3,-2,-3,-1, 1,-4,-3,-2,11, 2,-3, // W
     -2,-2,-2,-3,-2,-1,-2,-3, 2,-1,-1,-2,-1, 3,-3,-2,-2, 2, 7,-1, // Y
      0,-3,-3,-3,-1,-2,-2,-3,-3, 3, 1,-2, 1,-1,-2,-2, 0,-3,-1, 4  // V
+};
+
+// 4-bit packed BLOSUM62 (200 bytes): each byte stores 2 consecutive values
+// Low nibble = even index, high nibble = odd index, add 4 before packing
+__device__ const uint8_t blosum62_4bit_packed[200] = {
+    0x38, 0x22, 0x34, 0x43, 0x32, 0x33, 0x23, 0x53, 0x14, 0x42, 
+    0x93, 0x24, 0x51, 0x24, 0x14, 0x62, 0x13, 0x32, 0x13, 0x12, 
+    0x42, 0x5a, 0x41, 0x44, 0x15, 0x41, 0x12, 0x52, 0x04, 0x12, 
+    0x22, 0xa5, 0x41, 0x36, 0x13, 0x30, 0x11, 0x43, 0x03, 0x11, 
+    0x14, 0x11, 0x1d, 0x10, 0x31, 0x13, 0x23, 0x31, 0x23, 0x32, 
+    0x53, 0x44, 0x91, 0x26, 0x14, 0x52, 0x14, 0x43, 0x23, 0x23, 
+    0x43, 0x64, 0x60, 0x29, 0x14, 0x51, 0x12, 0x43, 0x13, 0x22, 
+    0x24, 0x34, 0x21, 0xa2, 0x02, 0x20, 0x11, 0x42, 0x22, 0x11, 
+    0x42, 0x35, 0x41, 0x24, 0x1c, 0x31, 0x32, 0x32, 0x22, 0x16, 
+    0x13, 0x11, 0x13, 0x01, 0x81, 0x16, 0x45, 0x21, 0x13, 0x73, 
+    0x23, 0x01, 0x23, 0x01, 0x61, 0x28, 0x46, 0x21, 0x23, 0x53, 
+    0x63, 0x34, 0x51, 0x25, 0x13, 0x92, 0x13, 0x43, 0x13, 0x22, 
+    0x33, 0x12, 0x43, 0x12, 0x52, 0x36, 0x49, 0x32, 0x33, 0x53, 
+    0x12, 0x11, 0x12, 0x11, 0x43, 0x14, 0xa4, 0x20, 0x52, 0x37, 
+    0x23, 0x32, 0x31, 0x23, 0x12, 0x31, 0x02, 0x3b, 0x03, 0x21, 
+    0x35, 0x45, 0x43, 0x44, 0x23, 0x42, 0x23, 0x83, 0x15, 0x22, 
+    0x34, 0x34, 0x33, 0x23, 0x32, 0x33, 0x23, 0x53, 0x29, 0x42, 
+    0x11, 0x00, 0x22, 0x21, 0x12, 0x12, 0x53, 0x10, 0xf2, 0x16, 
+    0x22, 0x12, 0x32, 0x12, 0x36, 0x23, 0x73, 0x21, 0x62, 0x3b, 
+    0x14, 0x11, 0x23, 0x12, 0x71, 0x25, 0x35, 0x22, 0x14, 0x83
 };
 
 __device__ __constant__ int8_t char_to_uint[256] = {
@@ -52,276 +164,172 @@ __device__ __constant__ int8_t char_to_uint[256] = {
     ['V'] = 19
 };
 
-template<int BLOCK_DIM_X, int MAX_SHARED_QUERY_LEN_SW>
-__global__ void sw_kernel(
-    const unsigned char* query_seq_indices,
-    int query_seq_len,
-    int* good_idx,
-    const uint8_t* ascii,
-    int* starts, // array contains the starting position of sequences
-    int num_db_seqs,
-    int* out_scores,
-    int gap_penalty
-) {
-    const int seq_idx_global = blockIdx.x;
-    if (seq_idx_global >= num_db_seqs) return; 
-    
-    int start = starts[good_idx[seq_idx_global]-1] + 1;
-    int stop = starts[good_idx[seq_idx_global]] + 1;
-    int length = stop - start - 1;
 
-    if (query_seq_len == 0 || length == 0 || query_seq_len > MAX_SHARED_QUERY_LEN_SW || stop < start) {
-        //printf("sw_kernel skipping %d\n", seq_idx_global);
-        out_scores[seq_idx_global] = -1;
-        return; 
-    }
+// Include linear gap kernel
+#include "sw_linear.cu"
+#include "sw_affine.cu"
+#include "sw_affine_uint8.cu"
+#include "sw_profile.cu"
 
-    constexpr int TPT = MAX_SHARED_QUERY_LEN_SW / 32;
-    ascii = ascii + start;  
+// Helper functions for half2 (Ada Lovelace optimized)
 
-    // Move BLOSUM62 matrix to shared memory 
-    __shared__ int8_t s_blosum62_matrix[NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA]; // 400=0.4k
-    for (int i = threadIdx.x; i < (NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA); i += BLOCK_DIM_X) {
-        s_blosum62_matrix[i] = blosum62_matrix_cuda_global[i];
-    }
-
-    // Move query sequence to local variable. 
-    __shared__ unsigned char s_query_seq_sdata[MAX_SHARED_QUERY_LEN_SW]; 
-    for (int i = threadIdx.x; i < MAX_SHARED_QUERY_LEN_SW; i += BLOCK_DIM_X) {
-        if (i < query_seq_len) s_query_seq_sdata[i] = query_seq_indices[i];
-        else s_query_seq_sdata[i] = 0; 
-    }
-
-    const int lane   = threadIdx.x;      // 0-31 inside the war
-    //const int warpId = threadIdx.x >> 5; // divide by 32 = 2**5 = num_threads. 
-    int p_thread_max_score = 0; 
-
-    /* ─────────────────────────  STRIPE  VERSION  ───────────────────────── */
-    const int j_begin = lane * TPT;
-    const int j_end   = min(j_begin + TPT, query_seq_len);   // open interval
-    //uint16_t diag_val = 0; 
-    uint16_t prev[TPT];// = {0};
-    uint16_t curr[TPT];// = {0};
-    #pragma unroll
-    for (int k = 0; k < TPT; ++k) { prev[k] = 0; curr[k] = 0; }
-
-    for (int i_db = 0; i_db < length; ++i_db)   {
-        /* upper-left neighbour of the first column in my stripe */
-        //int active_cols  = max(0,min(TPT, query_seq_len - j_begin));   // columns this lane owns
-        uint16_t last_up = prev[TPT - 1];               // H(i-1, j_end-1)
-        uint16_t diag_val = __shfl_up_sync(0xffffffff, last_up, 1);
-        if (lane == 0) diag_val = 0;
-
-        /* constant for the whole row */
-        int8_t indx = ascii[i_db];
-        int8_t db_idx = char_to_uint[indx]; // -1 when bad. 
-        uint16_t h_left = 0;                    // H(i, j-1) inside my stripe
-
-        /* ── column loop over my stripe ────────────────────────────────── */
-        #pragma unroll
-        for (int k = 0; k < TPT; ++k) {
-            int j_query = j_begin + k;
-            if (j_query >= query_seq_len) break;
-
-            unsigned char query_char_val = s_query_seq_sdata[j_query]; // loading constant doesn't change speed here. 
-
-            int8_t sub_score = (db_idx < 0 || db_idx >= NUM_AMINO_ACIDS_CUDA)
-                                ? -4
-                                :s_blosum62_matrix[db_idx * NUM_AMINO_ACIDS_CUDA + query_char_val]; // removing this makes 5.2 -> 4.69ms
-
-            uint16_t h_up_pred   = prev[k];      // H(i-1, j)
-            uint16_t h_diag_pred = diag_val;     // H(i-1, j-1)
-            uint16_t h_left_pred = h_left;       // H(i,   j-1)
-
-            // removing max to all adds makes it 5.2ms -> 3.96ms
-            // rtx5090 has single operation for this stuff. 
-            uint16_t cur = max(0,
-                            max(h_diag_pred + sub_score,
-                                        max(h_up_pred + gap_penalty,
-                                                        h_left_pred + gap_penalty)
-                                                        )
-                                                        );
-            curr[k] = cur;
-            p_thread_max_score = max(p_thread_max_score, cur);
-
-            diag_val = h_up_pred;   // becomes upper-left for next column
-            h_left   = cur;         // carry within stripe
-        }
-
-        #pragma unroll
-        for (int k = 0; k < TPT; ++k)  prev[k] = curr[k];   // next row's "up"
-        diag_val = __shfl_up_sync(0xffffffff, prev[TPT-1], 1);
-        if (lane == 0) diag_val = 0;
-    }
-
-
-    // Reduction to find max score in the block
-    __shared__ int s_reduction_array[BLOCK_DIM_X]; 
-    s_reduction_array[threadIdx.x] = p_thread_max_score;
-    __syncwarp();
-
-    // Parallel reduction in shared memory
-    // Each iteration halves the number of active threads and values to compare
-    for (int offset = BLOCK_DIM_X / 2; offset > 0; offset >>= 1) {
-        // offset will be BLOCK_DIM_X/2, BLOCK_DIM_X/4, ..., 1
-        if (threadIdx.x < offset) {
-            s_reduction_array[threadIdx.x] = max(s_reduction_array[threadIdx.x], s_reduction_array[threadIdx.x + offset]);
-        }
-        __syncwarp(); 
-    }
-
-    // The final maximum score for the block is now in s_reduction_array[0]
-    if (threadIdx.x == 0) {
-        out_scores[seq_idx_global] = s_reduction_array[0];
-    }
-    __syncthreads();
-    // 220ms
+__device__ __forceinline__ int16_t half2int(half h) {
+    return (int16_t)__half2short_rn(h);
 }
 
-// penalizing opening. 
-template<int BLOCK_DIM_X, int MAX_SHARED_QUERY_LEN_SW>
-__global__ void sw_kernel_affine(
-    const unsigned char* query_seq_indices,
-    int query_seq_len,
-    int* good_idx,
-    const uint8_t* ascii,
-    int* starts, // call length earlier -- refactor to call starts, it contains the starting position of all sequences!
-    int num_db_seqs,
-    int* out_scores,
-    int gap_open,
-    int gap_extend
-) {
-    const int seq_idx_global = blockIdx.x;
-    if (seq_idx_global >= num_db_seqs) return;
+__device__ __forceinline__ half int2half(int16_t i) {
+    return __short2half_rn(i);
+}
+
+// Precomputed triangular numbers for unpacking: col*(col+1)/2 for col=0..19
+__device__ __constant__ int tril_offsets[20] = { 0, 1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 66, 78, 91, 105, 120, 136, 153, 171, 190 };
+
+// Simple unpacker for 4-bit packed BLOSUM from shared memory (symmetric matrix)
+__device__ __forceinline__ int8_t unpack_blosum_shared(int row, int col, const unsigned char* packed) {
+    // Ensure we access lower triangle (symmetric)
+    if (row > col) {
+        int tmp = row;
+        row = col;
+        col = tmp;
+    }
     
-    int start = starts[good_idx[seq_idx_global]-1] + 1;
-    int stop = starts[good_idx[seq_idx_global]] + 1;
-    int length = stop - start - 1;
-
-    if (query_seq_len == 0 || length == 0 || query_seq_len > MAX_SHARED_QUERY_LEN_SW || stop < start) {
-        out_scores[seq_idx_global] = -1;
-        return;
+    // Linear index in lower triangle using lookup table
+    int linear_idx = tril_offsets[col] + row;
+    int byte_idx = linear_idx >> 1;
+    unsigned char packed_byte = packed[byte_idx];
+    
+    int8_t value;
+    if (linear_idx & 1) {
+        value = (int8_t)((packed_byte >> 4) & 0x0F) - 4;
+    } else {
+        value = (int8_t)(packed_byte & 0x0F) - 4;
     }
+    
+    return value;
+}
 
-    constexpr int TPT = MAX_SHARED_QUERY_LEN_SW / 32;
-    ascii = ascii + start;
 
-    __shared__ int8_t s_blosum62_matrix[NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA];
-    for (int i = threadIdx.x; i < (NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA); i += BLOCK_DIM_X) {
-        s_blosum62_matrix[i] = blosum62_matrix_cuda_global[i];
+// Unpack 4-bit BLOSUM value from packed array in registers
+// Given (row, col) where row <= col (lower triangle), returns BLOSUM score
+__device__ __forceinline__ int8_t unpack_blosum_4bit_from_regs(
+    int row, int col,
+    uint4 r0, uint4 r1, uint4 r2, uint4 r3, uint4 r4, uint4 r5, uint4 r6) {
+    
+    // Ensure we access lower triangle (symmetric matrix)
+    if (row > col) {
+        int tmp = row;
+        row = col;
+        col = tmp;
     }
-
-    __shared__ unsigned char s_query_seq_sdata[MAX_SHARED_QUERY_LEN_SW];
-    for (int i = threadIdx.x; i < MAX_SHARED_QUERY_LEN_SW; i += BLOCK_DIM_X) {
-        if (i < query_seq_len) s_query_seq_sdata[i] = query_seq_indices[i];
-        else s_query_seq_sdata[i] = 0;
+    
+    // Linear index in lower triangle
+    int linear_idx = col * (col + 1) / 2 + row;
+    
+    // Two values per byte
+    int byte_idx = linear_idx >> 1;
+    
+    // Extract byte from appropriate register
+    unsigned char packed_byte;
+    if (byte_idx < 16) {
+        packed_byte = reinterpret_cast<const unsigned char*>(&r0)[byte_idx];
+    } else if (byte_idx < 32) {
+        packed_byte = reinterpret_cast<const unsigned char*>(&r1)[byte_idx - 16];
+    } else if (byte_idx < 48) {
+        packed_byte = reinterpret_cast<const unsigned char*>(&r2)[byte_idx - 32];
+    } else if (byte_idx < 64) {
+        packed_byte = reinterpret_cast<const unsigned char*>(&r3)[byte_idx - 48];
+    } else if (byte_idx < 80) {
+        packed_byte = reinterpret_cast<const unsigned char*>(&r4)[byte_idx - 64];
+    } else if (byte_idx < 96) {
+        packed_byte = reinterpret_cast<const unsigned char*>(&r5)[byte_idx - 80];
+    } else {
+        packed_byte = reinterpret_cast<const unsigned char*>(&r6)[byte_idx - 96];
     }
-
-    const int lane = threadIdx.x;
-    //const int warpId = threadIdx.x >> 5;
-    int p_thread_max_score = 0;
-
-    const int j_begin = lane * TPT;
-    const int j_end = min(j_begin + TPT, query_seq_len);
-    // Change score type to int16_t for signed arithmetic
-    const int16_t ZERO16 = 0;
-    int16_t diag_val_M = 0, diag_val_Ix = 0, diag_val_Iy = 0;
-    int16_t prev_M[TPT], prev_Ix[TPT], prev_Iy[TPT];
-    int16_t curr_M[TPT], curr_Ix[TPT], curr_Iy[TPT];
-    #pragma unroll
-    for (int k = 0; k < TPT; ++k) {
-        prev_M[k] = prev_Ix[k] = prev_Iy[k] = 0;
-        curr_M[k] = curr_Ix[k] = curr_Iy[k] = 0;
+    
+    // Extract 4-bit value
+    int8_t value;
+    if (linear_idx & 1) {
+        value = (int8_t)((packed_byte >> 4) & 0x0F) - 4;
+    } else {
+        value = (int8_t)(packed_byte & 0x0F) - 4;
     }
+    
+    return value;
+}
 
-    for (int i_db = 0; i_db < length; ++i_db) {
-        uint16_t last_up_M = prev_M[TPT - 1];
-        uint16_t last_up_Ix = prev_Ix[TPT - 1];
-        uint16_t last_up_Iy = prev_Iy[TPT - 1];
-        diag_val_M = __shfl_up_sync(0xffffffff, last_up_M, 1);
-        diag_val_Ix = __shfl_up_sync(0xffffffff, last_up_Ix, 1);
-        diag_val_Iy = __shfl_up_sync(0xffffffff, last_up_Iy, 1);
-        if (lane == 0) {
-            diag_val_M = diag_val_Ix = diag_val_Iy = 0;
+// ============================================================================
+// Utility Kernels
+// ============================================================================
+
+// Simple kernel to zero out the output scores array
+__global__ void zero_scores_kernel(int* out_scores, int num_sequences) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_sequences) {
+        out_scores[idx] = 0;
+    }
+}
+
+
+// Kernel to build combined BLOSUM [db0][db1][qchar] -> half2(blosum[q][d0], blosum[q][d1])
+// NOTE: Dimension order changed to [db0][db1][qchar] to avoid bank conflicts!
+// Also builds simple 2D BLOSUM as half
+__global__ void build_combined_blosum_kernel() {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA;
+    
+    // Build simple 2D BLOSUM as half (first 400 threads)
+    if (idx < NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA) {
+        blosum62_as_half_global[idx] = int2half((int16_t)blosum62_matrix_cuda_global[idx]);
+    }
+    
+    // Build combined 3D BLOSUM (half2 version - 32KB)
+    // NEW LAYOUT: [db0][db1][qchar] instead of [qchar][db0][db1]
+    if (idx < total) {
+        int db0 = idx / (NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA);
+        int remainder = idx % (NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA);
+        int db1 = remainder / NUM_AMINO_ACIDS_CUDA;
+        int qchar = remainder % NUM_AMINO_ACIDS_CUDA;
+        
+        int8_t score0, score1;
+        
+        // Padding character (index 20) gets large negative score to prevent accumulation
+        if (db0 == 20 || qchar == 20) {
+            score0 = -127;
+        } else {
+            score0 = blosum62_matrix_cuda_global[qchar * 20 + db0];  // Use 20, not NUM_AMINO_ACIDS_CUDA
         }
-
-        int8_t indx = ascii[i_db];
-        int8_t db_idx = char_to_uint[indx];
-        uint16_t h_left_M = 0, h_left_Ix = 0;
-        //uint16_t h_left_Iy;// = 0;
-
-        #pragma unroll
-        for (int k = 0; k < TPT; ++k) {
-            int j_query = j_begin + k;
-            if (j_query >= query_seq_len) break;
-
-            unsigned char query_char_val = s_query_seq_sdata[j_query];
-            int8_t sub_score = (db_idx < 0 || db_idx >= NUM_AMINO_ACIDS_CUDA)
-                                ? -4
-                                : s_blosum62_matrix[db_idx * NUM_AMINO_ACIDS_CUDA + query_char_val];
-
-            int16_t h_up_M  = prev_M[k];
-            int16_t h_up_Ix = prev_Ix[k];
-            int16_t h_up_Iy = prev_Iy[k];
-            int16_t h_diag_M = diag_val_M;
-            int16_t h_diag_Ix = diag_val_Ix;
-            int16_t h_diag_Iy = diag_val_Iy;
-            int16_t h_left_M_pred = h_left_M;
-            int16_t h_left_Ix_pred = h_left_Ix;
-            //int16_t h_left_Iy_pred = h_left_Iy;
-
-            // M(i,j)
-            int16_t cur_M = max(ZERO16,
-                               max(h_diag_M + sub_score,
-                                            max(h_diag_Ix + sub_score,
-                                                         h_diag_Iy + sub_score)));
-            // Ix(i,j) : gap in query (horizontal): coming from left
-            int16_t cur_Ix = max(ZERO16,
-                                max(h_left_M_pred - gap_open,
-                                             h_left_Ix_pred - gap_extend));
-            // Iy(i,j) : gap in target (vertical): coming from up
-            int16_t cur_Iy = max(ZERO16,
-                                max(h_up_M - gap_open,
-                                             h_up_Iy - gap_extend));
-
-            curr_M[k] = cur_M;
-            curr_Ix[k] = cur_Ix;
-            curr_Iy[k] = cur_Iy;
-
-            p_thread_max_score = max(p_thread_max_score,
-                                        max(cur_M, max(cur_Ix, cur_Iy)));
-
-            diag_val_M = h_up_M;
-            diag_val_Ix = h_up_Ix;
-            diag_val_Iy = h_up_Iy;
-            h_left_M = cur_M;
-            h_left_Ix = cur_Ix;
-            //h_left_Iy = cur_Iy;
+        
+        if (db1 == 20 || qchar == 20) {
+            score1 = -127;
+        } else {
+            score1 = blosum62_matrix_cuda_global[qchar * 20 + db1];
         }
-
-        #pragma unroll
-        for (int k = 0; k < TPT; ++k) {
-            prev_M[k] = curr_M[k];
-            prev_Ix[k] = curr_Ix[k];
-            prev_Iy[k] = curr_Iy[k];
-        }
+        
+        blosum62_combined_cuda_global[idx] = __halves2half2(int2half(score0), int2half(score1));
+        
+        // Build int8 combined version (16KB) - stores 2x int8_t scores as uint16
+        uint16_t int8_packed = ((uint16_t)(score1 & 0xFF) << 8) | (uint16_t)(score0 & 0xFF);
+        blosum62_int8_combined_global[idx] = int8_packed;
+        
+        // Build 4-bit packed version (8KB) - low nibble=score0, high nibble=score1
+        uint8_t packed0 = (uint8_t)(score0 + 4);  // Offset to 0-15
+        uint8_t packed1 = (uint8_t)(score1 + 4);
+        blosum62_3d_packed[idx] = (packed1 << 4) | packed0;
     }
+}
 
-    __shared__ int s_reduction_array[BLOCK_DIM_X];
-    s_reduction_array[threadIdx.x] = p_thread_max_score;
-    __syncwarp();
-
-    for (int offset = BLOCK_DIM_X / 2; offset > 0; offset >>= 1) {
-        if (threadIdx.x < offset) {
-            s_reduction_array[threadIdx.x] = max(s_reduction_array[threadIdx.x], s_reduction_array[threadIdx.x + offset]);
-        }
-        __syncwarp();
-    }
-
-    if (threadIdx.x == 0) {
-        out_scores[seq_idx_global] = s_reduction_array[0];
-    }
-    __syncthreads();
+// Host function to initialize combined BLOSUM (call once at startup)
+extern "C" void initialize_combined_blosum() {
+    int total = NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    build_combined_blosum_kernel<<<blocks, threads>>>();
+    cudaDeviceSynchronize();
+    
+    // Copy to constant memory for faster access
+    cudaMemcpyToSymbol(blosum62_combined_cuda_constant, blosum62_combined_cuda_global, 
+                       total * sizeof(__half2));
+    cudaDeviceSynchronize();
 }
 
 
@@ -334,7 +342,7 @@ __global__ void sw_kernel_affine(
 
 
 extern "C"
-void launch_sw_cuda_blosum62(
+void launch_sw_cuda_affine(
         const uint8_t* query_seq_indices_ptr,
         int            query_length,
         int*           good_idx,
@@ -342,35 +350,331 @@ void launch_sw_cuda_blosum62(
         int*           lengths,
         int            num_sequences_in_db, // Actual number of DB sequences
         int*           output_scores_ptr,
-        int            gap_val,
+        int            gap_open,
+        int            gap_extend,
+        int            db_seq_length,  // NEW: sequence length passed from Python
         cudaStream_t   stream)
 {
-    dim3 num_blocks(num_sequences_in_db);
-    int threads_per_block_val = 32; 
-    dim3 threads_per_block_dim(threads_per_block_val); 
-    dim3 block(32, 1, 1);
-    dim3 grid(num_sequences_in_db, 1, 1);            // one block per DB sequence
-
-    // round query length up to the nearest multiple of 32 for template dispatch
-    int rounded_len = ((query_length + 31) >> 5) << 5;
-
-    switch (rounded_len) {
-        LAUNCH_CASE(32)   LAUNCH_CASE(64)   LAUNCH_CASE(96)
-        LAUNCH_CASE(128)  LAUNCH_CASE(160)  LAUNCH_CASE(192)
-        LAUNCH_CASE(224)  LAUNCH_CASE(256)  LAUNCH_CASE(288)
-        LAUNCH_CASE(320)  LAUNCH_CASE(352)  LAUNCH_CASE(384)
-        LAUNCH_CASE(416)  LAUNCH_CASE(448)  LAUNCH_CASE(480)
-        LAUNCH_CASE(512)  LAUNCH_CASE(544)  LAUNCH_CASE(576)
-        LAUNCH_CASE(608)  LAUNCH_CASE(640)  LAUNCH_CASE(672)
-        LAUNCH_CASE(704)  LAUNCH_CASE(736)  LAUNCH_CASE(768)
-        LAUNCH_CASE(800)  LAUNCH_CASE(832)  LAUNCH_CASE(864)
-        LAUNCH_CASE(896)  LAUNCH_CASE(928)  LAUNCH_CASE(960)
-        LAUNCH_CASE(992)  LAUNCH_CASE(1024)
+    // Initialize 3D packed BLOSUM once per device
+    static bool blosum_initialized[8] = {false}; // Support up to 8 GPUs
+    int device;
+    cudaGetDevice(&device);
+    if (!blosum_initialized[device]) {
+        int total = NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        build_combined_blosum_kernel<<<blocks, threads>>>();
+        cudaDeviceSynchronize();
+        blosum_initialized[device] = true;
     }
+    
+    // Zero out output scores to avoid garbage from unprocessed sequences
+    {
+        int threads = 256;
+        int blocks = (num_sequences_in_db + threads - 1) / threads;
+        zero_scores_kernel<<<blocks, threads, 0, stream>>>(output_scores_ptr, num_sequences_in_db);
+    }
+    
+    // 256 threads per block (8 warps), processing 64 sequences per block
+    constexpr int THREADS_PER_BLOCK = 256;
+    
+    // Use the sequence length passed from Python
+    // printf("DEBUG: db_seq_length=%d (from Python)\n", db_seq_length);
+    
+    // Round up to nearest multiple of 8, then find closest supported length
+    int rounded = ((db_seq_length + 7) / 8) * 8;
+
+    // Round up to nearest multiple of 32
+    int dispatch_length = ((db_seq_length + 31) / 32) * 32;
+
+    // Clamp to valid range (kernel will handle individual sequences via length0/length1)
+    //if (dispatch_length < 32) dispatch_length = 32;
+    //if (dispatch_length > 1024) dispatch_length = 1024;
+
+    // Macro to launch kernel with given SUB_WARP_SIZE and TPT
+    #define LAUNCH_KERNEL(SUB_WARP, TPT_VAL) \
+        do { \
+            constexpr int SUB_WARP_SIZE = SUB_WARP; \
+            constexpr int TPT = TPT_VAL; \
+            constexpr int SEQS_PER_BLOCK = (THREADS_PER_BLOCK / 32) * (32 / SUB_WARP_SIZE) * 2; \
+            dim3 block(THREADS_PER_BLOCK, 1, 1); \
+            dim3 grid((num_sequences_in_db + SEQS_PER_BLOCK - 1) / SEQS_PER_BLOCK, 1, 1); \
+            sw_kernel_affine<THREADS_PER_BLOCK, SUB_WARP_SIZE, TPT> \
+                <<<grid, block, 0, stream>>>( \
+                    query_seq_indices_ptr, query_length, good_idx, ascii, lengths, \
+                    num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); \
+        } while(0)
+    
+    // Dispatch based on rounded-up database sequence length (SUB_WARP_SIZE * TPT >= db_seq_length)
+    switch (dispatch_length) {
+        case 32: LAUNCH_KERNEL(8, 4); break;  // ratio: 2.0
+        case 64: LAUNCH_KERNEL(8, 8); break;  // ratio: 1.0
+        case 96: LAUNCH_KERNEL(8, 12); break;  // ratio: 1.5
+        case 128: LAUNCH_KERNEL(8, 16); break;  // ratio: 2.0
+        case 160: LAUNCH_KERNEL(16, 10); break;  // ratio: 1.6
+        case 192: LAUNCH_KERNEL(16, 12); break;  // ratio: 1.3
+        case 224: LAUNCH_KERNEL(16, 14); break;  // ratio: 1.1
+        case 256: LAUNCH_KERNEL(16, 16); break;  // ratio: 1.0
+        case 288: LAUNCH_KERNEL(16, 18); break;  // ratio: 1.1
+        case 320: LAUNCH_KERNEL(16, 20); break;  // ratio: 1.2
+        case 352: LAUNCH_KERNEL(16, 22); break;  // ratio: 1.4
+        case 384: LAUNCH_KERNEL(16, 24); break;  // ratio: 1.5
+        case 416: LAUNCH_KERNEL(16, 26); break;  // ratio: 1.6
+        case 448: LAUNCH_KERNEL(16, 28); break;  // ratio: 1.8
+        case 480: LAUNCH_KERNEL(16, 30); break;  // ratio: 1.9
+        case 512: LAUNCH_KERNEL(16, 32); break;  // ratio: 2.0
+        case 544: LAUNCH_KERNEL(32, 17); break;  // ratio: 1.9
+        case 576: LAUNCH_KERNEL(32, 18); break;  // ratio: 1.8
+        case 608: LAUNCH_KERNEL(32, 19); break;  // ratio: 1.7
+        case 640: LAUNCH_KERNEL(32, 20); break;  // ratio: 1.6
+        case 672: LAUNCH_KERNEL(32, 21); break;  // ratio: 1.5
+        case 704: LAUNCH_KERNEL(32, 22); break;  // ratio: 1.5
+        case 736: LAUNCH_KERNEL(32, 23); break;  // ratio: 1.4
+        case 768: LAUNCH_KERNEL(32, 24); break;  // ratio: 1.3
+        case 800: LAUNCH_KERNEL(32, 25); break;  // ratio: 1.3
+        case 832: LAUNCH_KERNEL(32, 26); break;  // ratio: 1.2
+        case 864: LAUNCH_KERNEL(32, 27); break;  // ratio: 1.2
+        case 896: LAUNCH_KERNEL(32, 28); break;  // ratio: 1.1
+        case 928: LAUNCH_KERNEL(32, 29); break;  // ratio: 1.1
+        case 960: LAUNCH_KERNEL(32, 30); break;  // ratio: 1.1
+        case 992: LAUNCH_KERNEL(32, 31); break;  // ratio: 1.0
+        case 1024: LAUNCH_KERNEL(32, 32); break;  // ratio: 1.0
+        default:
+            printf("Error: Unsupported dispatch_length %d\n", dispatch_length);
+            return;
+    }
+
+        
+    #undef LAUNCH_KERNEL
 }
 
+
+
 extern "C"
-void launch_sw_cuda_affine(
+void launch_sw_cuda_profile(
+        const int8_t*  pssm_ptr,        // PSSM matrix: (query_length x 20)
+        int            query_length,
+        int*           good_idx,
+        const uint8_t* ascii,
+        int*           lengths,
+        int            num_sequences_in_db,
+        int*           output_scores_ptr,
+        int            gap_open,
+        int            gap_extend,
+        int            db_seq_length,
+        cudaStream_t   stream)
+{
+    // No BLOSUM initialization needed - we use PSSM
+    
+    // Zero out output scores to avoid garbage from unprocessed sequences
+    {
+        int threads = 256;
+        int blocks = (num_sequences_in_db + threads - 1) / threads;
+        zero_scores_kernel<<<blocks, threads, 0, stream>>>(output_scores_ptr, num_sequences_in_db);
+    }
+    
+    // 256 threads per block (8 warps), processing 64 sequences per block
+    constexpr int THREADS_PER_BLOCK = 256;
+    
+    // Round up to nearest multiple of 32
+    int dispatch_length = ((db_seq_length + 31) / 32) * 32;
+
+    // Macro to launch kernel with given SUB_WARP_SIZE and TPT
+    #define LAUNCH_KERNEL(SUB_WARP, TPT_VAL) \
+        do { \
+            constexpr int SUB_WARP_SIZE = SUB_WARP; \
+            constexpr int TPT = TPT_VAL; \
+            constexpr int SEQS_PER_BLOCK = (THREADS_PER_BLOCK / 32) * (32 / SUB_WARP_SIZE) * 2; \
+            dim3 block(THREADS_PER_BLOCK, 1, 1); \
+            dim3 grid((num_sequences_in_db + SEQS_PER_BLOCK - 1) / SEQS_PER_BLOCK, 1, 1); \
+            sw_kernel_profile<THREADS_PER_BLOCK, SUB_WARP_SIZE, TPT> \
+                <<<grid, block, 0, stream>>>( \
+                    pssm_ptr, query_length, good_idx, ascii, lengths, \
+                    num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); \
+        } while(0)
+    
+    // Dispatch based on rounded-up database sequence length (SUB_WARP_SIZE * TPT >= db_seq_length)
+    switch (dispatch_length) {
+        case 32: LAUNCH_KERNEL(8, 4); break;  // ratio: 2.0
+        case 64: LAUNCH_KERNEL(8, 8); break;  // ratio: 1.0
+        case 96: LAUNCH_KERNEL(8, 12); break;  // ratio: 1.5
+        case 128: LAUNCH_KERNEL(8, 16); break;  // ratio: 2.0
+        case 160: LAUNCH_KERNEL(16, 10); break;  // ratio: 1.6
+        case 192: LAUNCH_KERNEL(16, 12); break;  // ratio: 1.3
+        case 224: LAUNCH_KERNEL(16, 14); break;  // ratio: 1.1
+        case 256: LAUNCH_KERNEL(16, 16); break;  // ratio: 1.0
+        case 288: LAUNCH_KERNEL(16, 18); break;  // ratio: 1.1
+        case 320: LAUNCH_KERNEL(16, 20); break;  // ratio: 1.2
+        case 352: LAUNCH_KERNEL(16, 22); break;  // ratio: 1.4
+        case 384: LAUNCH_KERNEL(16, 24); break;  // ratio: 1.5
+        case 416: LAUNCH_KERNEL(16, 26); break;  // ratio: 1.6
+        case 448: LAUNCH_KERNEL(16, 28); break;  // ratio: 1.8
+        case 480: LAUNCH_KERNEL(16, 30); break;  // ratio: 1.9
+        case 512: LAUNCH_KERNEL(16, 32); break;  // ratio: 2.0
+        case 544: LAUNCH_KERNEL(32, 17); break;  // ratio: 1.9
+        case 576: LAUNCH_KERNEL(32, 18); break;  // ratio: 1.8
+        case 608: LAUNCH_KERNEL(32, 19); break;  // ratio: 1.7
+        case 640: LAUNCH_KERNEL(32, 20); break;  // ratio: 1.6
+        case 672: LAUNCH_KERNEL(32, 21); break;  // ratio: 1.5
+        case 704: LAUNCH_KERNEL(32, 22); break;  // ratio: 1.5
+        case 736: LAUNCH_KERNEL(32, 23); break;  // ratio: 1.4
+        case 768: LAUNCH_KERNEL(32, 24); break;  // ratio: 1.3
+        case 800: LAUNCH_KERNEL(32, 25); break;  // ratio: 1.3
+        case 832: LAUNCH_KERNEL(32, 26); break;  // ratio: 1.2
+        case 864: LAUNCH_KERNEL(32, 27); break;  // ratio: 1.2
+        case 896: LAUNCH_KERNEL(32, 28); break;  // ratio: 1.1
+        case 928: LAUNCH_KERNEL(32, 29); break;  // ratio: 1.1
+        case 960: LAUNCH_KERNEL(32, 30); break;  // ratio: 1.1
+        case 992: LAUNCH_KERNEL(32, 31); break;  // ratio: 1.0
+        case 1024: LAUNCH_KERNEL(32, 32); break;  // ratio: 1.0
+        default:
+            printf("Error: Unsupported dispatch_length %d\n", dispatch_length);
+            return;
+    }
+
+        
+    #undef LAUNCH_KERNEL
+}
+
+// ============================================================================
+// Linear Gap Penalty Launcher (for screening/prefilter)
+// ============================================================================
+extern "C"
+void launch_sw_cuda_linear(
+        const uint8_t* query_seq_indices_ptr,
+        int            query_length,
+        int*           good_idx,
+        const uint8_t* ascii,
+        int*           lengths,
+        int            num_sequences_in_db,
+        int*           output_scores_ptr,
+        int            gap_penalty,       // Single gap penalty (linear)
+        int            db_seq_length,     // Sequence length passed from Python
+        cudaStream_t   stream)
+{
+#if COMPILE_LINEAR
+    // Initialize 3D packed BLOSUM once
+    static bool blosum_initialized = false;
+    if (!blosum_initialized) {
+        int total = NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        build_combined_blosum_kernel<<<blocks, threads>>>();
+        cudaDeviceSynchronize();
+        
+        // Copy to constant memory for linear kernel
+        cudaMemcpyToSymbol(blosum62_combined_cuda_constant, blosum62_combined_cuda_global, 
+                           total * sizeof(__half2));
+        cudaDeviceSynchronize();
+        
+        blosum_initialized = true;
+    }
+    
+    // Zero out output scores to avoid garbage from unprocessed sequences
+    {
+        int threads = 256;
+        int blocks = (num_sequences_in_db + threads - 1) / threads;
+        zero_scores_kernel<<<blocks, threads, 0, stream>>>(output_scores_ptr, num_sequences_in_db);
+    }
+    
+    // 256 threads per block (8 warps), processing sequences per block
+    constexpr int THREADS_PER_BLOCK = 256;
+    
+    // Round up to nearest multiple of 32
+    int dispatch_length = ((db_seq_length + 31) / 32) * 32;
+
+    // Macro to launch kernel with given SUB_WARP_SIZE and TPT
+    #define LAUNCH_KERNEL(SUB_WARP, TPT_VAL) \
+        do { \
+            constexpr int SUB_WARP_SIZE = SUB_WARP; \
+            constexpr int TPT = TPT_VAL; \
+            constexpr int SEQS_PER_BLOCK = (THREADS_PER_BLOCK / 32) * (32 / SUB_WARP_SIZE) * 2; \
+            dim3 block(THREADS_PER_BLOCK, 1, 1); \
+            dim3 grid((num_sequences_in_db + SEQS_PER_BLOCK - 1) / SEQS_PER_BLOCK, 1, 1); \
+            sw_kernel_linear<THREADS_PER_BLOCK, SUB_WARP_SIZE, TPT> \
+                <<<grid, block, 0, stream>>>( \
+                    query_seq_indices_ptr, query_length, good_idx, ascii, lengths, \
+                    num_sequences_in_db, output_scores_ptr, gap_penalty); \
+        } while(0)
+    
+    // Dispatch based on rounded-up database sequence length (SUB_WARP_SIZE * TPT >= db_seq_length)
+    // LINEAR GAP: Using 2x higher TPT than affine due to ~50% lower register pressure
+    
+    #if DEV_MODE
+    // DEV MODE: Only compile 4 sizes for fast iteration
+    switch (dispatch_length) {
+        case 32:
+        case 64:
+        case 96:
+        case 128: LAUNCH_KERNEL(8, 16); break;
+        case 160:
+        case 192:
+        case 224:
+        case 256: LAUNCH_KERNEL(8, 32); break;
+        case 288:
+        case 320:
+        case 352:
+        case 384:
+        case 416:
+        case 448:
+        case 480:
+        case 512: LAUNCH_KERNEL(16, 32); break;
+        default:
+            // 544-1024 and beyond
+            LAUNCH_KERNEL(16, 64);
+            break;
+    }
+    #else
+    // PRODUCTION MODE: Compile optimized size for each length
+    switch (dispatch_length) {
+        case 32: LAUNCH_KERNEL(8, 4); break;
+        case 64: LAUNCH_KERNEL(8, 8); break;
+        case 96: LAUNCH_KERNEL(8, 12); break;
+        case 128: LAUNCH_KERNEL(8, 16); break;
+        case 160: LAUNCH_KERNEL(8, 20); break;
+        case 192: LAUNCH_KERNEL(8, 24); break;
+        case 224: LAUNCH_KERNEL(8, 28); break;
+        case 256: LAUNCH_KERNEL(8, 32); break;
+        case 288: LAUNCH_KERNEL(16, 18); break;
+        case 320: LAUNCH_KERNEL(16, 20); break;
+        case 352: LAUNCH_KERNEL(16, 22); break;
+        case 384: LAUNCH_KERNEL(16, 24); break;
+        case 416: LAUNCH_KERNEL(16, 26); break;
+        case 448: LAUNCH_KERNEL(16, 28); break;
+        case 480: LAUNCH_KERNEL(16, 30); break;
+        case 512: LAUNCH_KERNEL(16, 32); break;
+        case 544: LAUNCH_KERNEL(16, 34); break;
+        case 576: LAUNCH_KERNEL(16, 36); break;
+        case 608: LAUNCH_KERNEL(16, 38); break;
+        case 640: LAUNCH_KERNEL(16, 40); break;
+        case 672: LAUNCH_KERNEL(16, 42); break;
+        case 704: LAUNCH_KERNEL(16, 44); break;
+        case 736: LAUNCH_KERNEL(16, 46); break;
+        case 768: LAUNCH_KERNEL(16, 48); break;
+        case 800: LAUNCH_KERNEL(16, 50); break;
+        case 832: LAUNCH_KERNEL(16, 52); break;
+        case 864: LAUNCH_KERNEL(16, 54); break;
+        case 896: LAUNCH_KERNEL(16, 56); break;
+        case 928: LAUNCH_KERNEL(16, 58); break;
+        case 960: LAUNCH_KERNEL(16, 60); break;
+        case 992: LAUNCH_KERNEL(16, 62); break;
+        case 1024: LAUNCH_KERNEL(16, 64); break;
+        default:
+            printf("Error: Unsupported dispatch_length %d\n", dispatch_length);
+            return;
+    }
+    #endif  // DEV_MODE
+        
+    #undef LAUNCH_KERNEL
+#else
+    printf("ERROR: COMPILE_LINEAR is disabled!\n");
+#endif
+}
+
+
+
+extern "C"
+void launch_sw_cuda_affine_uint8(
         const uint8_t* query_seq_indices_ptr,
         int            query_length,
         int*           good_idx,
@@ -382,44 +686,260 @@ void launch_sw_cuda_affine(
         int            gap_extend,
         cudaStream_t   stream)
 {
-    dim3 num_blocks(num_sequences_in_db);
-    int threads_per_block_val = 32;
-    dim3 threads_per_block_dim(threads_per_block_val);
-    dim3 block(32, 1, 1);
-    dim3 grid(num_sequences_in_db, 1, 1);
-    int rounded_len = ((query_length + 31) >> 5) << 5;
-    switch (rounded_len) {
-        case 32:   sw_kernel_affine<32, 32>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 64:   sw_kernel_affine<32, 64>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 96:   sw_kernel_affine<32, 96>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 128:  sw_kernel_affine<32, 128> <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 160:  sw_kernel_affine<32, 160> <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 192:  sw_kernel_affine<32, 192> <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 224:  sw_kernel_affine<32, 224> <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 256:  sw_kernel_affine<32, 256> <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 288:  sw_kernel_affine<32, 288>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 320:  sw_kernel_affine<32, 320>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 352:  sw_kernel_affine<32, 352>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 384:  sw_kernel_affine<32, 384>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 416:  sw_kernel_affine<32, 416>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 448:  sw_kernel_affine<32, 448>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 480:  sw_kernel_affine<32, 480>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 512:  sw_kernel_affine<32, 512>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 544:  sw_kernel_affine<32, 544>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 576:  sw_kernel_affine<32, 576>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 608:  sw_kernel_affine<32, 608>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 640:  sw_kernel_affine<32, 640>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 672:  sw_kernel_affine<32, 672>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 704:  sw_kernel_affine<32, 704>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 736:  sw_kernel_affine<32, 736>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 768:  sw_kernel_affine<32, 768>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 800:  sw_kernel_affine<32, 800>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 832:  sw_kernel_affine<32, 832>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 864:  sw_kernel_affine<32, 864>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 896:  sw_kernel_affine<32, 896>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 928:  sw_kernel_affine<32, 928>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 960:  sw_kernel_affine<32, 960>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 992:  sw_kernel_affine<32, 992>  <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
-        case 1024: sw_kernel_affine<32, 1024> <<<grid, block, 0, stream>>>(query_seq_indices_ptr, query_length, good_idx, ascii, lengths, num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); break;
+    // Initialize 3D packed BLOSUM once
+    static bool blosum_initialized = false;
+    if (!blosum_initialized) {
+        int total = NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        build_combined_blosum_kernel<<<blocks, threads>>>();
+        cudaDeviceSynchronize();
+        blosum_initialized = true;
     }
+    
+    // Zero out output scores to avoid garbage from unprocessed sequences
+    {
+        int threads = 256;
+        int blocks = (num_sequences_in_db + threads - 1) / threads;
+        zero_scores_kernel<<<blocks, threads, 0, stream>>>(output_scores_ptr, num_sequences_in_db);
+    }
+    
+    // 256 threads per block (8 warps), processing 64 sequences per block
+    constexpr int THREADS_PER_BLOCK = 256;
+    
+    // Compute database sequence length from first sequence
+    int h_starts[2];
+    cudaMemcpy(h_starts, lengths, 2 * sizeof(int), cudaMemcpyDeviceToHost);
+    int db_seq_length = h_starts[1] - h_starts[0] - 1;
+    
+    // Macro to launch kernel with given SUB_WARP_SIZE and TPT
+    #define LAUNCH_KERNEL(SUB_WARP, TPT_VAL) \
+        do { \
+            constexpr int SUB_WARP_SIZE = SUB_WARP; \
+            constexpr int TPT = TPT_VAL; \
+            constexpr int SEQS_PER_BLOCK = (THREADS_PER_BLOCK / 32) * (32 / SUB_WARP_SIZE) * 4; \
+            dim3 block(THREADS_PER_BLOCK, 1, 1); \
+            dim3 grid((num_sequences_in_db + SEQS_PER_BLOCK - 1) / SEQS_PER_BLOCK, 1, 1); \
+            sw_kernel_affine_int8<THREADS_PER_BLOCK, SUB_WARP_SIZE, TPT> \
+                <<<grid, block, 0, stream>>>( \
+                    query_seq_indices_ptr, query_length, good_idx, ascii, lengths, \
+                    num_sequences_in_db, output_scores_ptr, gap_open, gap_extend); \
+        } while(0)
+    
+    // Dispatch based on database sequence length (SUB_WARP_SIZE * TPT = db_seq_length)
+    switch (db_seq_length) {
+        case 128: LAUNCH_KERNEL(8, 16);  break;
+        case 256: LAUNCH_KERNEL(16, 16); break;
+        case 512: LAUNCH_KERNEL(32, 16); break;
+        case 1024: LAUNCH_KERNEL(32, 32); break;
+        default:
+            printf("Error: Unsupported db_seq_length %d\n", db_seq_length);
+            return;
+    }
+    
+    #undef LAUNCH_KERNEL
+}
+
+extern "C"
+void launch_sw_cuda_affine_antidiag(
+        const uint8_t* query_seq_indices_ptr,
+        int            query_length,
+        int*           good_idx,
+        const uint8_t* ascii,
+        int*           lengths,
+        int            num_sequences_in_db,
+        int*           output_scores_ptr,
+        int            gap_open,
+        int            gap_extend,
+        cudaStream_t   stream) {
+
+            return;
+}
+
+// ================================================================================================
+// BACKTRACKING VERSION - 
+// ================================================================================================
+#include "sw_backtrack_vram.cu"
+
+extern "C"
+void launch_sw_cuda_affine_backtrack(
+        const uint8_t* query_seq_indices_ptr,
+        int            query_length,
+        int*           good_idx,
+        const uint8_t* ascii,
+        int*           lengths,
+        int            num_sequences_in_db,
+        int*           output_scores_ptr,
+        int*           output_alignment_lens_ptr,
+        int*           output_end_i_ptr,
+        int*           output_end_j_ptr,
+        char*          output_alignment_ops_ptr,
+        int            max_align_len,
+        int            gap_open,
+        int            gap_extend,
+        cudaStream_t   stream)
+{
+    // Initialize 3D packed BLOSUM once per device
+    static bool blosum_initialized[8] = {false}; // Support up to 8 GPUs
+    int device;
+    cudaGetDevice(&device);
+    if (!blosum_initialized[device]) {
+        int total = NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA * NUM_AMINO_ACIDS_CUDA;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        build_combined_blosum_kernel<<<blocks, threads>>>();
+        cudaDeviceSynchronize();
+        blosum_initialized[device] = true;
+    }
+    
+    // Zero out output scores to avoid garbage from unprocessed sequences
+    {
+        int threads = 256;
+        int blocks = (num_sequences_in_db + threads - 1) / threads;
+        zero_scores_kernel<<<blocks, threads, 0, stream>>>(output_scores_ptr, num_sequences_in_db);
+    }
+    
+    // Allocate matrix buffers in global memory (instead of checkpoints)
+    // Each sequence needs: [max_target_len][max_query_len] matrices for H, E, F
+    // Using half2 (4 bytes each), storing packed values
+    
+    // 256 threads per block (8 warps), processing sequences per block
+    constexpr int THREADS_PER_BLOCK = 256;
+    
+    // Compute actual database sequence length from first sequence and find max
+    // Use heap allocation for large arrays (avoid stack overflow)
+    int* h_starts = new int[num_sequences_in_db + 1];
+    cudaMemcpy(h_starts, lengths, (num_sequences_in_db + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+    
+    int max_target_len = 0;
+    for (int i = 0; i < num_sequences_in_db; i++) {
+        int seq_len = h_starts[i + 1] - h_starts[i] - 1;
+        if (seq_len > max_target_len) max_target_len = seq_len;
+    }
+    
+    int db_seq_length = h_starts[1] - h_starts[0] - 1;  // First sequence length for dispatch
+    delete[] h_starts;  // Free heap memory
+    
+    int max_query_len = query_length;
+    
+    // Round up max_target_len to nearest 32 for better memory alignment
+    max_target_len = ((max_target_len + 31) / 32) * 32;
+    
+    // Storage: direction pointers (1 byte per cell, contains 2x2-bit directions)
+    // Matrix dimensions: [num_pairs][max_query_len][max_target_len]
+    // Note: We use double-packing (2 seqs per pair), so allocate based on pairs not sequences
+    int num_pairs = (num_sequences_in_db + 1) / 2;  // Round up for odd number of sequences
+    size_t matrix_size_per_pair = (size_t)max_query_len * max_target_len;
+    size_t matrix_bytes = num_pairs * matrix_size_per_pair * sizeof(uint8_t);  // 1 byte per cell!
+    
+    uint8_t* global_directions;
+    cudaMalloc(&global_directions, matrix_bytes);
+    
+    // Round up to nearest multiple of 32
+    int dispatch_length = ((db_seq_length + 31) / 32) * 32;
+
+    // Macro to launch kernel with given SUB_WARP_SIZE and TPT
+    #define LAUNCH_KERNEL(SUB_WARP, TPT_VAL) \
+        do { \
+            constexpr int SUB_WARP_SIZE = SUB_WARP; \
+            constexpr int TPT = TPT_VAL; \
+            constexpr int SEQS_PER_BLOCK = (THREADS_PER_BLOCK / 32) * (32 / SUB_WARP_SIZE) * 2; \
+            dim3 block(THREADS_PER_BLOCK, 1, 1); \
+            dim3 grid((num_sequences_in_db + SEQS_PER_BLOCK - 1) / SEQS_PER_BLOCK, 1, 1); \
+            sw_kernel_affine_backtrack<THREADS_PER_BLOCK, SUB_WARP_SIZE, TPT> \
+                <<<grid, block, 0, stream>>>( \
+                    query_seq_indices_ptr, query_length, good_idx, ascii, lengths, \
+                    num_sequences_in_db, output_scores_ptr, output_alignment_lens_ptr, \
+                    output_end_i_ptr, output_end_j_ptr, output_alignment_ops_ptr, max_align_len, \
+                    gap_open, gap_extend, global_directions, max_target_len, max_query_len); \
+        } while(0)
+    
+    // Dispatch based on rounded-up database sequence length (SUB_WARP_SIZE * TPT >= db_seq_length)
+    // DEV MODE: Only compile 4 sizes for fast iteration (~5s vs 88s compile time)
+    #if DEV_MODE
+    switch (dispatch_length) {
+        case 32:
+        case 64:
+        case 96:
+        case 128: LAUNCH_KERNEL(8, 16); break;
+        case 160:
+        case 192:
+        case 224:
+        case 256: LAUNCH_KERNEL(16, 16); break;
+        case 288:
+        case 320:
+        case 352:
+        case 384:
+        case 416:
+        case 448:
+        case 480:
+        case 512: LAUNCH_KERNEL(16, 32); break;
+        default:
+            // 544-1024 and beyond
+            LAUNCH_KERNEL(32, 32);
+            break;
+    }
+    #else
+    // PRODUCTION MODE: Compile optimized kernel for each length
+    switch (dispatch_length) {
+        case 32: LAUNCH_KERNEL(8, 4); break;
+        case 64: LAUNCH_KERNEL(8, 8); break;
+        case 96: LAUNCH_KERNEL(8, 12); break;
+        case 128: LAUNCH_KERNEL(8, 16); break;
+        case 160: LAUNCH_KERNEL(16, 10); break;
+        case 192: LAUNCH_KERNEL(16, 12); break;
+        case 224: LAUNCH_KERNEL(16, 14); break;
+        case 256: LAUNCH_KERNEL(16, 16); break;
+        case 288: LAUNCH_KERNEL(16, 18); break;
+        case 320: LAUNCH_KERNEL(16, 20); break;
+        case 352: LAUNCH_KERNEL(16, 22); break;
+        case 384: LAUNCH_KERNEL(16, 24); break;
+        case 416: LAUNCH_KERNEL(16, 26); break;
+        case 448: LAUNCH_KERNEL(16, 28); break;
+        case 480: LAUNCH_KERNEL(16, 30); break;
+        case 512: LAUNCH_KERNEL(16, 32); break;
+        case 544: LAUNCH_KERNEL(32, 17); break;
+        case 576: LAUNCH_KERNEL(32, 18); break;
+        case 608: LAUNCH_KERNEL(32, 19); break;
+        case 640: LAUNCH_KERNEL(32, 20); break;
+        case 672: LAUNCH_KERNEL(32, 21); break;
+        case 704: LAUNCH_KERNEL(32, 22); break;
+        case 736: LAUNCH_KERNEL(32, 23); break;
+        case 768: LAUNCH_KERNEL(32, 24); break;
+        case 800: LAUNCH_KERNEL(32, 25); break;
+        case 832: LAUNCH_KERNEL(32, 26); break;
+        case 864: LAUNCH_KERNEL(32, 27); break;
+        case 896: LAUNCH_KERNEL(32, 28); break;
+        case 928: LAUNCH_KERNEL(32, 29); break;
+        case 960: LAUNCH_KERNEL(32, 30); break;
+        case 992: LAUNCH_KERNEL(32, 31); break;
+        case 1024: LAUNCH_KERNEL(32, 32); break;
+        default:
+            printf("Error: Unsupported dispatch_length %d\n", dispatch_length);
+            return;
+    }
+    #endif  // DEV_MODE
+        
+    #undef LAUNCH_KERNEL
+    
+    // Launch traceback kernel to reconstruct alignments
+    {
+        int threads = 256;
+        int blocks = (num_sequences_in_db + threads - 1) / threads;
+        sw_traceback_kernel<<<blocks, threads, 0, stream>>>(
+            global_directions,
+            output_scores_ptr,
+            output_alignment_lens_ptr,
+            output_end_i_ptr,
+            output_end_j_ptr,
+            output_alignment_ops_ptr,
+            max_align_len,
+            num_sequences_in_db,
+            max_target_len,
+            max_query_len
+        );
+    }
+    
+    // Free direction buffer
+    cudaFree(global_directions);
 }
